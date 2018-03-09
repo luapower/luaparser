@@ -1,11 +1,18 @@
 --go@ bin/mingw64/luajit -jp *
 
+io.stdout:setvbuf'no'
+io.stderr:setvbuf'no'
+require'strict'
+local pp = require'pp'
+
+if not ... then require'luaparser_demo'; return end
+
 --Lua lexer and parser using LuaJIT+ffi.
 --Translated from llex.c v2.20.1.2 (Lua 5.1.5) by Cosmin Apreutesei.
 
 local ffi = require'ffi'
 local bit = require'bit'
-local ljs = require'ljstring'
+local ljs = require'ljstr'
 local C = ffi.C
 
 --lexer ----------------------------------------------------------------------
@@ -20,14 +27,6 @@ local function isnewline(c)
 	return c == 10 or c == 13
 end
 
-local tokens = {
-	concat = '..',
-	dots = '...',
-	eq = '==',
-	ge = '>=',
-	le = '<=',
-	ne = '~=',
-}
 local reserved = {}
 for _,k in ipairs{
 	'and', 'break', 'do', 'else', 'elseif',
@@ -35,7 +34,6 @@ for _,k in ipairs{
 	'in', 'local', 'nil', 'not', 'or', 'repeat',
 	'return', 'then', 'true', 'until', 'while',
 } do
-	tokens[k] = k
 	reserved[k] = true
 end
 
@@ -94,17 +92,17 @@ local function lexer(read, source)
 	local save --fw. decl.
 
 	local function format_token(token)
-		if token == 'name' or token == 'string' or token == 'number' then
+		if token == '<name>' or token == '<string>' or token == '<number>' then
 			save(0)
 			return str(buf)
 		else
-			return tokens[token] or token
+			return token
 		end
 	end
 	local function lexerror(msg, token)
 		msg = string.format('%s:%d: %s', chunkid(source), linenumber, msg)
 		if token then
-			msg = string.format('%s near %s', msg, format_token(token))
+			msg = string.format('%s near \'%s\'', msg, format_token(token))
 		end
 		error(msg)
 	end
@@ -180,7 +178,7 @@ local function lexer(read, source)
 		return true
 	end
 
-	local function lex_number()
+	local function parse_number()
 		assert(isdigit(c))
 		repeat
 			save_and_nextchar()
@@ -194,7 +192,11 @@ local function lexer(read, source)
 			save_and_nextchar()
 		end
 		save(0)
-		return strscan(buf)
+		local n = strscan(buf)
+		if not n then
+			lexerror('malformed number', '<number>')
+		end
+		return n
 	end
 
 
@@ -211,7 +213,7 @@ local function lexer(read, source)
 	end
 
 
-	local function lex_long_string(seminfo, sep)
+	local function parse_long_string(seminfo, sep)
 		local cont = 0
 		save_and_nextchar()  -- skip 2nd `['
 		if isnewline(c) then  -- string starts with a newline?
@@ -220,7 +222,7 @@ local function lexer(read, source)
 		while true do
 			if c == EOF then
 				lexerror(seminfo and 'unfinished long string'
-					or 'unfinished long comment', 'eos')
+					or 'unfinished long comment', '<eos>')
 				-- to avoid warnings
 			elseif c == b']' then
 				if skip_sep() == sep then
@@ -246,23 +248,23 @@ local function lexer(read, source)
 		end
 	end
 
-	local function lex_string()
+	local function parse_string()
 		local delim = c
 		save_and_nextchar()
 		while c ~= delim do
 			if c == EOF then
-				lexerror('unfinished string', 'eos')
+				lexerror('unfinished string', '<eos>')
 			elseif isnewline(c) then
-				lexerror('unfinished string', 'string')
+				lexerror('unfinished string', '<string>')
 			elseif c == b'\\' then
 				nextchar() -- do not save the `\'
-				if     c == b'a' then save(b'\a'); nextchar(); goto continue
-				elseif c == b'b' then save(b'\b'); nextchar(); goto continue
-				elseif c == b'f' then save(b'\f'); nextchar(); goto continue
-				elseif c == b'n' then save(b'\n'); nextchar(); goto continue
-				elseif c == b'r' then save(b'\r'); nextchar(); goto continue
-				elseif c == b't' then save(b'\t'); nextchar(); goto continue
-				elseif c == b'v' then save(b'\v'); nextchar(); goto continue
+				if     c == b'a' then save_and_nextchar(b'\a'); goto continue
+				elseif c == b'b' then save_and_nextchar(b'\b'); goto continue
+				elseif c == b'f' then save_and_nextchar(b'\f'); goto continue
+				elseif c == b'n' then save_and_nextchar(b'\n'); goto continue
+				elseif c == b'r' then save_and_nextchar(b'\r'); goto continue
+				elseif c == b't' then save_and_nextchar(b'\t'); goto continue
+				elseif c == b'v' then save_and_nextchar(b'\v'); goto continue
 				elseif isnewline(c) then -- go through
 					save(b'\n')
 					inclinenumber()
@@ -281,7 +283,7 @@ local function lexer(read, source)
 						i = i + 1
 					until not (i < 3 and isdigit(c))
 					if d > 255 then
-						lexerror('escape sequence too large', 'string')
+						lexerror('escape sequence too large', '<string>')
 					end
 					save(d)
 					goto continue
@@ -296,7 +298,7 @@ local function lexer(read, source)
 		return s
 	end
 
-	local function lex()
+	local function next_token()
 		resetbuffer()
 		while true do
 			if isnewline(c) then
@@ -311,7 +313,7 @@ local function lexer(read, source)
 					local sep = skip_sep() --int
 					resetbuffer()  -- `skip_sep' may dirty the buffer
 					if sep >= 0 then
-						local s = lex_long_string(nil, sep)  -- long comment
+						local s = parse_long_string(nil, sep)  -- long comment
 						resetbuffer()
 						goto continue
 					end
@@ -324,50 +326,50 @@ local function lexer(read, source)
 			elseif c == b'[' then
 				local sep = skip_sep()
 				if sep >= 0 then
-					local s = lex_long_string(true, sep)
-					return 'string', s
+					local s = parse_long_string(true, sep)
+					return '<string>', s
 				elseif sep == -1 then return '['
-				else lexerror('invalid long string delimiter', 'string') end
+				else lexerror('invalid long string delimiter', '<string>') end
 			elseif c == b'=' then
 				nextchar()
 				if c ~= b'=' then return '='
-				else nextchar() return 'eq' end
+				else nextchar() return '==' end
 			elseif c == b'<' then
 				nextchar()
 				if c ~= b'=' then return '<'
-				else nextchar() return 'le' end
+				else nextchar() return '<=' end
 			elseif c == b'>' then
 				nextchar()
 				if c ~= b'=' then return '>'
-				else nextchar() return 'ge' end
+				else nextchar() return '>=' end
 			elseif c == b'~' then
 				nextchar()
 				if c ~= b'=' then return '~'
-				else nextchar() return 'ne' end
+				else nextchar() return '~=' end
 			elseif c == b'"' or c == b'\'' then
-				return 'string', lex_string()
+				return '<string>', parse_string()
 			elseif c == b'.' then
 				save_and_nextchar()
 				if check_next(b'.') then
 					if check_next(b'.') then
-						return 'dots'  --...
+						return '...'
 					else
-						return 'concat' --..
+						return '..'
 					end
 				elseif not isdigit(c) then
 					return '.'
 				else
-					return 'number', lex_number()
+					return '<number>', parse_number()
 				end
 			elseif c == EOF then
-				return 'eos'
+				return '<eos>'
 			else
 				if isspace(c) then
 					assert(not isnewline(c))
 					nextchar()
 					goto continue
 				elseif isdigit(c) then
-					return 'number', lex_number()
+					return '<number>', parse_number()
 				elseif isalpha(c) or c == '_' then
 					-- identifier or reserved word
 					repeat
@@ -377,12 +379,12 @@ local function lexer(read, source)
 					if reserved[s] then  -- reserved word?
 						return s
 					else
-						return 'name', s
+						return '<name>', s
 					end
 				else
 					local c0 = c
 					nextchar()
-					return c0  -- single-char tokens (+ - / ...)
+					return string.char(c0)  -- single-char tokens (+ - / ...)
 				end
 			end
 			::continue::
@@ -394,28 +396,28 @@ local function lexer(read, source)
 
 	local lexer = {}
 
-	local token, info
-	local lookahead_token, lookahead_info = 'eos'
+	local token, token_val
+	local lookahead_token, lookahead_info = '<eos>'
 	local lastline = 1 -- line of last token consumed
 
 	function lexer.next()
 		lastline = linenumber
-		if lookahead_token ~= 'eos' then --is there a look-ahead token?
-			token, info = lookahead_token, lookahead_info --use this one
-			lookahead_token, lookahead_info = 'eos' --and discharge it
+		if lookahead_token ~= '<eos>' then --is there a look-ahead token?
+			token, token_val = lookahead_token, lookahead_info --use this one
+			lookahead_token, lookahead_info = '<eos>' --and discharge it
 		else
-			token, info = lex() --read next token
+			token, token_val = next_token()
 		end
-		return token, info, linenumber
+		return token, token_val, linenumber
 	end
 
 	function lexer.lookahead()
-		assert(lookahead_token == 'eos')
+		assert(lookahead_token == '<eos>')
 		lookahead_token, lookahead_info = lex()
 		return lookahead_token, lookahead_info, linenumber
 	end
 
-	function lexer:error(msg, token)
+	function lexer:error(msg)
 		lexerror(msg, token)
 	end
 
@@ -427,73 +429,69 @@ end
 local VARARG_HASARG   = 1
 local VARARG_ISVARARG = 2
 local VARARG_NEEDSARG = 4
+local LUA_MULTRET = -1
+
+--[[
+typedef enum {
+  VVOID,	/* no value */
+  VNIL,
+  VTRUE,
+  VFALSE,
+  VK,		/* info = index of constant in `k' */
+  VKNUM,	/* nval = numerical value */
+  VLOCAL,	/* info = local register */
+  VUPVAL,       /* info = index of upvalue in `upvalues' */
+  VGLOBAL,	/* info = index of table; aux = index of global name in `k' */
+  VINDEXED,	/* info = table register; aux = index register (or `k') */
+  VJMP,		/* info = instruction pc */
+  VRELOCABLE,	/* info = instruction pc */
+  VNONRELOC,	/* info = result register */
+  VCALL,	/* info = instruction pc */
+  VVARARG	/* info = instruction pc */
+} expkind;
+]]
+
+-- Marks the end of a patch list. It is an invalid value both as an absolute
+-- address, and as a list link (would link an element to itself).
+local NO_JUMP = -1
 
 local function parser(lexer)
 
-	local token, info, linenumber
+	local chunk, expr, open_func, close_func --fw. decl.
+	local token, token_val, linenumber --lexer state
+	local fs --parser state
 
-	local function lex_next()
-		token, info, linenumber = lexer:next()
+	local function next()
+		token, token_val, linenumber = lexer:next()
 	end
 
-	local function syntaxerror(msg, token)
-		return lexer:error(msg, token)
-	end
-
-	local function token2str(token)
-		return tokens[token] or token
-	end
-
-	local function testnext(c)
-		if token == c then
-			lex_next()
+	local function nextif(tok)
+		if token == tok then
+			next()
 			return true
 		else
 			return false
 		end
 	end
 
+	local function syntaxerror(msg)
+		return lexer:error(msg)
+	end
+
+	local function error_expected(token)
+		syntaxerror(string.format('\'%s\' expected', token))
+	end
+
 	local function check_match(what, who, where)
-		if not testnext(what) then
+		if not nextif(what) then
 			if where == linenumber then
 				error_expected(what)
 			else
 				syntaxerror(string.format(
-					'"%s" expected (to close "%s" at line %d)',
-						token2str(what), token2str(who), where))
+					'\'%s\' expected (to close \'%s\' at line %d)',
+						what, who, where))
 			end
 		end
-	end
-
-	--#define hasmultret(k)		((k) == VCALL or (k) == VVARARG)
-
-	--#define getlocvar(fs, i)	((fs).f.locvars[(fs).actvar[i]])
-
-	--nodes for block list (list of active blocks)
-	ffi.cdef[[
-	typedef struct BlockCnt {
-		struct BlockCnt *previous,  -- chain
-		int breaklist,  -- list of jumps out of this loop
-		lu_byte nactvar,  -- # active locals outside the breakable structure
-		lu_byte upval,  -- true if some variable in the block is an upvalue
-		lu_byte isbreakable,  -- true if `block' is a loop
-	} BlockCnt;
-	]]
-
-	-- prototypes for recursive non-terminal functions
-	local chunk, expr --fw. decl.
-
-	local function error_expected(token)
-		syntaxerror(string.format('"%s" expected', token2str(token)))
-	end
-
-
-	local function errorlimit(fs, limit, what)
-		local msg = (fs.f.linedefined == 0) and
-			luaO_pushfstring(fs.L, "main function has more than %d %s", limit, what) or
-			luaO_pushfstring(fs.L, "function at line %d has more than %d %s",
-										 fs.f.linedefined, limit, what)
-		luaX_lexerror(fs.ls, msg, 0)
 	end
 
 	local function check(c)
@@ -502,110 +500,100 @@ local function parser(lexer)
 		end
 	end
 
-	local function checknext(c)
-		check(c)
-		lex_next()
-	end
-
-	--#define check_condition(ls,c,msg)	{ if (!(c)) syntaxerror(msg) }
-
-	local function str_checkname()
-		local s = check'name'
-		local ts = ls.t.seminfo.ts
-		lex_next()
-		return ts
-	end
-
-
-	local function init_exp(e, k, i)
-		e.f = NO_JUMP
-		e.t = NO_JUMP
-		e.k = k
-		e.u.s.info = i
+	local function checkif(cond, msg)
+		if not cond then
+			syntaxerror(msg)
+		end
 	end
 
 	local function codestring(e, s)
-		init_exp(e, VK, luaK_stringK(ls.fs, s))
+		init_exp(e, 'k', s) --luaK_stringK(fs, s))
 	end
 
 	local function checkname(e)
-		codestring(ls, e, str_checkname(ls))
+		check'<name>'
+		local s = token_val
+		next()
+		if e then
+			codestring(e, s)
+		end
+		return s
+	end
+
+	local function init_exp(e, k, i)
+		print('init_exp', k, i)
+	end
+
+	local function hasmultret(k)
+		return k == 'call' or k == 'vararg'
+	end
+
+	local function getlocvar(fs, i)
+		return fs.locvars[fs.actvar[i]]
 	end
 
 	local function registerlocalvar(varname)
-		local fs = ls.fs
-		local f = fs.f
-		local oldsize = f.sizelocvars
-		luaM_growvector(ls.L, f.locvars, fs.nlocvars, f.sizelocvars,
-							LocVar, SHRT_MAX, "too many local variables")
-		while oldsize < f.sizelocvars do
-			f.locvars[oldsize].varname = nil
+		local oldsize = fs.sizelocvars
+		--luaM_growvector(ls.L, fs.locvars, fs.nlocvars, fs.sizelocvars, LocVar, SHRT_MAX, "too many local variables")
+		while oldsize < fs.sizelocvars do
+			fs.locvars[oldsize].varname = nil
 			oldsize = oldsize + 1
 		end
-		f.locvars[fs.nlocvars].varname = varname
-		luaC_objbarrier(ls.L, f, varname)
+		fs.locvars[fs.nlocvars] = varname
+		--luaC_objbarrier(ls.L, f, varname)
 		local n = fs.nlocvars
 		fs.nlocvars = fs.nlocvars + 1
 		return n
 	end
 
-	--#define new_localvarliteral(ls,v,n) \
-		--new_localvar(ls, luaX_newstring(ls, "" v, (sizeof(v)/sizeof(char))-1), n)
+	--#define new_localvarliteral(v,n) \
+		--new_localvar(luaX_newstring( "" v, (sizeof(v)/sizeof(char))-1), n)
 
 
 	local function new_localvar(name, n)
-		local fs = ls.fs
-		fs.actvar[fs.nactvar+n] = ffi.cast('unsigned short', registerlocalvar(name))
+		fs.actvar[fs.nactvar + n] = registerlocalvar(name)
 	end
 
-
 	local function adjustlocalvars(nvars)
-		local fs = ls.fs
-		fs.nactvar = cast_byte(fs.nactvar + nvars)
-		while nvars > 0 do
-			getlocvar(fs, fs.nactvar - nvars).startpc = fs.pc
-			nvars = nvars - 1
-		end
+		fs.nactvar = fs.nactvar + nvars
 	end
 
 	local function removevars(tolevel)
-		local fs = ls.fs
 		while fs.nactvar > tolevel do
 			fs.nactvar = fs.nactvar - 1
-			getlocvar(fs, fs.nactvar).endpc = fs.pc
 		end
 	end
 
 	local function indexupvalue(fs, name, v)
 		local i
-		local f = fs.f
-		local oldsize = f.sizeupvalues
-		for i=0,f.nups-1 do
+		local oldsize = fs.sizeupvalues
+		for i=0,fs.nups-1 do
 			if fs.upvalues[i].k == v.k and fs.upvalues[i].info == v.u.s.info then
-				assert(f.upvalues[i] == name)
+				assert(fs.upvalues[i] == name)
 				return i
 			end
 		end
 		-- new one
-		--TODO: luaM_growvector(fs.L, f.upvalues, f.nups, f.sizeupvalues, TString *, MAX_INT, "")
-		while oldsize < f.sizeupvalues do
-			f.upvalues[oldsize] = nil
+		--TODO: luaM_growvector(fs.L, fs.upvalues, fs.nups, fs.sizeupvalues, TString *, MAX_INT, "")
+		while oldsize < fs.sizeupvalues do
+			fs.upvalues[oldsize] = nil
 			oldsize = oldsize + 1
 		end
-		f.upvalues[f.nups] = name
+		fs.upvalues[fs.nups] = name
 		luaC_objbarrier(fs.L, f, name)
-		assert(v.k == VLOCAL or v.k == VUPVAL)
-		fs.upvalues[f.nups].k = cast_byte(v.k)
-		fs.upvalues[f.nups].info = cast_byte(v.u.s.info)
-		local n = f.nups
-		f.nups = f.nups + 1
+		assert(v.k == 'local' or v.k == 'upval')
+		fs.upvalues[fs.nups].k = v.k
+		fs.upvalues[fs.nups].info = cast_byte(v.u.s.info)
+		local n = fs.nups
+		fs.nups = fs.nups + 1
 		return n
 	end
 
 	local function searchvar(fs, n)
 		for i = fs.nactvar-1, 0, -1 do
-		 if n == getlocvar(fs, i).varname then
-			return i
+			if n == getlocvar(fs, i).varname then
+				return i
+			end
 		end
 		return -1  -- not found
 	end
@@ -620,37 +608,35 @@ local function parser(lexer)
 
 	local function singlevaraux(fs, n, var, base)
 		if fs == nil then  -- no more levels?
-			init_exp(var, VGLOBAL, NO_REG)  -- default is global variable
-			return VGLOBAL
+			init_exp(var, 'global', n)  -- default is global variable
+			return 'global'
 		else
 			local v = searchvar(fs, n)  -- look up at current level
 			if v >= 0 then
-				init_exp(var, VLOCAL, v)
+				init_exp(var, 'local', v)
 				if not base then
 					markupval(fs, v)  -- local will be used as an upval
 				end
-				return VLOCAL
+				return 'local'
 			else -- not found at current level try upper one
-				if singlevaraux(fs.prev, n, var, 0) == VGLOBAL then
-					return VGLOBAL
+				if singlevaraux(fs.prev, n, var, 0) == 'global' then
+					return 'global'
 				end
 				var.u.s.info = indexupvalue(fs, n, var)  -- else was LOCAL or UPVAL
-				var.k = VUPVAL  -- upvalue in this level
-				return VUPVAL
+				var.k = 'upval'  -- upvalue in this level
+				return 'upval'
 			end
 		end
 	end
 
 	local function singlevar(var)
-		local varname = str_checkname(ls)
-		local fs = ls.fs
-		if singlevaraux(fs, varname, var, 1) == VGLOBAL then
-			var.u.s.info = luaK_stringK(fs, varname)  -- info points to global name
+		local varname = checkname()
+		if singlevaraux(fs, varname, var, 1) == 'global' then
+			--var.u.s.info = luaK_stringK(fs, varname)  -- info points to global name
 		end
 	end
 
 	local function adjust_assign(nvars, nexps, e)
-		local fs = ls.fs
 		local extra = nvars - nexps
 		if hasmultret(e.k) then
 			extra = extra + 1  -- includes call itself
@@ -658,15 +644,16 @@ local function parser(lexer)
 			luaK_setreturns(fs, e, extra)  -- last exp. provides the difference
 			if extra > 1 then luaK_reserveregs(fs, extra-1) end
 		else
-			if e.k ~= VVOID then luaK_exp2nextreg(fs, e) end -- close last expression
+			if e.k ~= 'void' then -- close last expression
+				--luaK_exp2nextreg(fs, e)
+			end
 			if extra > 0 then
 				local reg = fs.freereg
-				luaK_reserveregs(fs, extra)
-				luaK_nil(fs, reg, extra)
+				--luaK_reserveregs(fs, extra)
+				--luaK_nil(fs, reg, extra)
 			end
 		end
 	end
-
 
 	local function enterblock(fs, bl, isbreakable)
 		bl.breaklist = NO_JUMP
@@ -675,64 +662,61 @@ local function parser(lexer)
 		bl.upval = 0
 		bl.previous = fs.bl
 		fs.bl = bl
-		assert(fs.freereg == fs.nactvar)
 	end
 
 	local function leaveblock(fs)
 		local bl = fs.bl
 		fs.bl = bl.previous
-		removevars(fs.ls, bl.nactvar)
+		removevars(bl.nactvar)
 		if bl.upval then
-			luaK_codeABC(fs, OP_CLOSE, bl.nactvar, 0, 0)
+			--luaK_codeABC(fs, OP_CLOSE, bl.nactvar, 0, 0)
 		end
 		-- a block either controls scope or breaks (never both)
 		assert(not bl.isbreakable or not bl.upval)
 		assert(bl.nactvar == fs.nactvar)
 		fs.freereg = fs.nactvar  -- free registers
-		luaK_patchtohere(fs, bl.breaklist)
+		--luaK_patchtohere(fs, bl.breaklist)
 	end
 
 
 	local function pushclosure(func, v)
-		local fs = ls.fs
-		local f = fs.f
-		local oldsize = f.sizep
+		local oldsize = fs.sizep
 		local i
-		--luaM_growvector(ls.L, f.p, fs.np, f.sizep, Proto *, MAXARG_Bx, "constant table overflow")
-		while oldsize < f.sizep do
+		--luaM_growvector(ls.L, fs.p, fs.np, fs.sizep, Proto *, MAXARG_Bx, "constant table overflow")
+		while oldsize < fs.sizep do
 			f.p[oldsize] = nil
 			oldsize = oldsize + 1
 		end
-		f.p[fs.np] = func.f
+		fs.p[fs.np] = func
 		fs.np = fs.np + 1
-		luaC_objbarrier(ls.L, f, func.f)
-		init_exp(v, VRELOCABLE, luaK_codeABx(fs, OP_CLOSURE, 0, fs.np-1))
-		for i = 0, func.f.nups-1 do
-			local o = func.upvalues[i].k == VLOCAL and OP_MOVE or OP_GETUPVAL
-			luaK_codeABC(fs, o, 0, func.upvalues[i].info, 0)
+		--luaC_objbarrier(ls.L, f, func.f)
+		init_exp(v, 'relocable', nil) --luaK_codeABx(fs, OP_CLOSURE, 0, fs.np-1))
+		for i = 0, func.nups-1 do
+			local o = func.upvalues[i].k == 'local' and OP_MOVE or OP_GETUPVAL
+			--luaK_codeABC(fs, o, 0, func.upvalues[i].info, 0)
 		end
 	end
 
 	-- GRAMMAR RULES ----------------------------------------------------------
 
 	local function field(v) -- ['.' | ':'] NAME
-		local fs = ls.fs
 		local key
-		luaK_exp2anyreg(fs, v)
-		lex_next()  -- skip the dot or colon
-		checkname(ls, key)
+		--luaK_exp2anyreg(fs, v)
+		next()  -- skip the dot or colon
+		checkname(key)
 		luaK_indexed(fs, v, key)
 	end
 
 	local function yindex(v)  -- '[' expr ']'
-		lexer:next()  -- skip the '['
-		expr(ls, v)
-		luaK_exp2val(ls.fs, v)
-		checknext(ls, ']')
+		next()  -- skip the '['
+		expr(v)
+		luaK_exp2val(fs, v)
+		check']'; next()
 	end
 
 	-- Rules for Constructors -------------------------------------------------
 
+	--[=[
 	ffi.cdef[[
 	struct ConsControl {
 		expdesc v  -- last list item read
@@ -742,36 +726,35 @@ local function parser(lexer)
 		int tostore  -- number of array elements pending to be stored
 	};
 	]]
+	]=]
 
 	local function recfield(cc) -- (NAME | `['exp1`]') = exp1
-		local fs = ls.fs
-		local reg = ls.fs.freereg
+		local reg = fs.freereg
 		local key, val
 		local rkkey
-		if token == 'name' then
+		if token == '<name>' then
 			checkname(key)
 		else -- token == '['
 			yindex(key)
 		end
 		cc.nh = cc.nh + 1
-		checknext'='
+		check'='; next()
 		rkkey = luaK_exp2RK(fs, key)
-		expr(ls, val)
-		luaK_codeABC(fs, OP_SETTABLE, cc.t.u.s.info, rkkey, luaK_exp2RK(fs, val))
+		expr(val)
+		--luaK_codeABC(fs, OP_SETTABLE, cc.t.u.s.info, rkkey, luaK_exp2RK(fs, val))
 		fs.freereg = reg  -- free registers
 	end
 
 
 	local function closelistfield(fs, cc)
-		if cc.v.k == VVOID then return end -- there is no list item
-		luaK_exp2nextreg(fs, cc.v)
-		cc.v.k = VVOID
+		if cc.v.k == 'void' then return end -- there is no list item
+		--luaK_exp2nextreg(fs, cc.v)
+		cc.v.k = 'void'
 		if (cc.tostore == LFIELDS_PER_FLUSH) then
 			luaK_setlist(fs, cc.t.u.s.info, cc.na, cc.tostore)  -- flush
 			cc.tostore = 0  -- no more items pending
 		end
 	end
-
 
 	local function lastlistfield(fs, cc)
 		if cc.tostore == 0 then return end
@@ -780,183 +763,180 @@ local function parser(lexer)
 			luaK_setlist(fs, cc.t.u.s.info, cc.na, LUA_MULTRET)
 			cc.na = cc.na - 1 -- do not count last expression (unknown number of elements)
 		else
-			if cc.v.k ~= VVOID then
-				luaK_exp2nextreg(fs, cc.v)
+			if cc.v.k ~= 'void' then
+				--luaK_exp2nextreg(fs, cc.v)
 			end
 			luaK_setlist(fs, cc.t.u.s.info, cc.na, cc.tostore)
 		end
 	end
 
 	local function listfield(cc)
-		expr(ls, cc.v)
+		expr(cc.v)
 		cc.na = cc.na + 1
 		cc.tostore = cc.tostore + 1
 	end
 
 	local function constructor(t) -- ??
-		local fs = ls.fs
-		local line = ls.linenumber
-		local pc = luaK_codeABC(fs, OP_NEWTABLE, 0, 0, 0)
+		local line = linenumber
+		--local pc = luaK_codeABC(fs, OP_NEWTABLE, 0, 0, 0)
 		local cc
 		cc.na = 0
 		cc.nh = 0
 		cc.tostore = 0
 		cc.t = t
-		init_exp(t, VRELOCABLE, pc)
-		init_exp(cc.v, VVOID, 0)  -- no value (yet)
-		luaK_exp2nextreg(ls.fs, t)  -- fix it at stack top (for gc)
-		checknext'then'
+		init_exp(t, 'relocable', pc)
+		init_exp(cc.v, 'void', 0)  -- no value (yet)
+		--luaK_exp2nextreg(fs, t)  -- fix it at stack top (for gc)
+		check'then'; next()
 		repeat
-			assert(cc.v.k == VVOID or cc.tostore > 0)
+			assert(cc.v.k == 'void' or cc.tostore > 0)
 			if token == 'end' then break end
 			closelistfield(fs, cc)
-			if token == 'name' then -- may be listfields or recfields
+			if token == '<name>' then -- may be listfields or recfields
 				luaX_lookahead()
 				if ls.lookahead.token ~= '=' then  -- expression?
-					listfield(ls, cc)
+					listfield(cc)
 				else
-					recfield(ls, cc)
+					recfield(cc)
 				end
 			elseif token == '[' then  -- constructor_item . recfield
-				recfield(ls, cc)
+				recfield(cc)
 			else -- constructor_part . listfield
-				listfield(ls, cc)
+				listfield(cc)
 			end
-		until not (testnext',' or testnext'')
-		check_match(ls, 'end', 'then', line)
+		until not (nextif',' or nextif'')
+		check_match('end', 'then', line)
 		lastlistfield(fs, cc)
-		SETARG_B(fs.f.code[pc], luaO_int2fb(cc.na)) -- set initial array size
-		SETARG_C(fs.f.code[pc], luaO_int2fb(cc.nh))  -- set initial table size
+		SETARG_B(fs.code[pc], luaO_int2fb(cc.na)) -- set initial array size
+		SETARG_C(fs.code[pc], luaO_int2fb(cc.nh))  -- set initial table size
 	end
 
 	local function parlist()  -- [ param { `,' param } ]
-		local fs = ls.fs
-		local f = fs.f
 		local nparams = 0
-		f.is_vararg = 0
+		fs.is_vararg = 0
 		if token ~= ')' then  -- is `parlist' not empty?
 			repeat
-				if token == 'name' then -- NAME
-					new_localvar(ls, str_checkname(ls), nparams)
+				if token == '<name>' then -- NAME
+					new_localvar(checkname(), nparams)
 					nparams = nparams + 1
-				elseif token == 'dots' then  -- `...'
-					lexer:next()
-					f.is_vararg = bit.bor(f.is_vararg, VARARG_ISVARARG)
+				elseif token == '...' then
+					next()
+					fs.is_vararg = bit.bor(fs.is_vararg, VARARG_ISVARARG)
 				else
-					syntaxerror('<name> or "..." expected')
+					syntaxerror('<name> or \'...\' expected')
 				end
-			until not (not f.is_vararg and testnext',')
+			until not (not fs.is_vararg and nextif',')
 		end
-		adjustlocalvars(ls, nparams)
-		f.numparams = cast_byte(fs.nactvar - bit.band(f.is_vararg, VARARG_HASARG))
-		luaK_reserveregs(fs, fs.nactvar)  -- reserve register for parameters
+		adjustlocalvars(nparams)
+		fs.numparams = fs.nactvar - bit.band(fs.is_vararg, VARARG_HASARG)
+		--luaK_reserveregs(fs, fs.nactvar)  -- reserve register for parameters
 	end
 
 	local function body(e, needself, line) -- `(' parlist `)' chunk END
-		local new_fs
-		open_func(ls, new_fs)
-		new_fs.f.linedefined = line
-		checknext(ls, '(')
+		print('body')
+		local new_fs = {nactvar = 0}
+		open_func(new_fs)
+		new_fs.linedefined = line
+		check'('; next()
 		if needself then
-			new_localvarliteral(ls, "self", 0)
-			adjustlocalvars(ls, 1)
+			print('!!! self')
+			--new_localvarliteral('self', 0)
+			adjustlocalvars(1)
 		end
-		parlist(ls)
-		checknext(ls, ')')
-		chunk(ls)
-		new_fs.f.lastlinedefined = ls.linenumber
-		check_match(ls, TK_END, TK_FUNCTION, line)
-		close_func(ls)
-		pushclosure(ls, new_fs, e)
+		parlist()
+		check')'; next()
+		chunk()
+		new_fs.lastlinedefined = linenumber
+		check_match('end', 'function', line)
+		close_func()
+		pushclosure(new_fs, e)
 	end
 
 	local function explist1(v) -- expr { `,' expr }
 		local n = 1  -- at least one expression
-		expr(ls, v)
-		while testnext',' do
-			luaK_exp2nextreg(ls.fs, v)
-			expr(ls, v)
+		expr(v)
+		while nextif',' do
+			--luaK_exp2nextreg(fs, v)
+			expr(v)
 			n = n + 1
 		end
 		return n
 	end
 
 	local function funcargs(f)
-		local fs = ls.fs
-		local args
+		local args = {}
 		local base, nparams
-		local line = ls.linenumber
+		local line = linenumber
 		if token == '(' then  -- `(' [ explist1 ] `)'
 			if line ~= ls.lastline then
 				syntaxerror'ambiguous syntax (function call x new statement)'
 			end
-			lexer:next()
+			next()
 			if token == ')' then  -- arg list is empty?
-				args.k = VVOID
+				args.k = 'void'
 			else
-				explist1(ls, args)
+				explist1(args)
 				luaK_setmultret(fs, args)
 			end
-			check_match(ls, ')', '(', line)
+			check_match(')', '(', line)
 		elseif token == 'then' then  -- constructor
-			constructor(ls, args)
-		elseif token == 'string' then  -- STRING
-			codestring(ls, args, ls.t.seminfo.ts)
-			lexer:next()  -- must use `seminfo' before `next'
+			constructor(args)
+		elseif token == '<string>' then  -- STRING
+			codestring(args, token_val)
+			next()  -- must use `seminfo' before `next'
 		else
-			syntaxerror("function arguments expected")
+			syntaxerror'function arguments expected'
 		end
 		assert(f.k == VNONRELOC)
-		base = f.u.s.info  -- base register for call
+		--base = f.u.s.info  -- base register for call
 		if hasmultret(args.k) then
 			nparams = LUA_MULTRET  -- open call
 		elseif args.k ~= VVOID then
-			luaK_exp2nextreg(fs, args)  -- close last argument
+			--luaK_exp2nextreg(fs, args)  -- close last argument
 			nparams = fs.freereg - (base+1)
 		end
-		init_exp(f, VCALL, luaK_codeABC(fs, OP_CALL, base, nparams+1, 2))
-		luaK_fixline(fs, line)
-		fs.freereg = base+1  -- call remove function and arguments and leaves (unless changed) one result
+		init_exp(f, 'call', nil) --luaK_codeABC(fs, OP_CALL, base, nparams+1, 2))
+		--luaK_fixline(fs, line)
+		--fs.freereg = base+1  -- call remove function and arguments and leaves (unless changed) one result
 	end
 
 	-- Expression parsing -----------------------------------------------------
 
 	local function prefixexp(v) -- NAME | '(' expr ')'
 		if token == '(' then
-			local line = ls.linenumber
-			lexer:next()
-			expr(ls, v)
-			check_match(ls, ')', '(', line)
-			luaK_dischargevars(ls.fs, v)
-		elseif token == 'name' then
-			singlevar(ls, v)
+			local line = linenumber
+			next()
+			expr(v)
+			check_match(')', '(', line)
+			luaK_dischargevars(fs, v)
+		elseif token == '<name>' then
+			singlevar(v)
 		else
-			syntaxerror("unexpected symbol")
+			syntaxerror'unexpected symbol'
 		end
 	end
 
 
-	-- primaryexp -> prefixexp { `.' NAME | `[' exp `]' | `:' NAME funcargs | funcargs }
+	-- prefixexp { `.' NAME | `[' exp `]' | `:' NAME funcargs | funcargs }
 	local function primaryexp(v)
-		local fs = ls.fs
-		prefixexp(ls, v)
+		prefixexp(v)
 		while true do
 			if token == '.' then  -- field
-				field(ls, v)
+				field(v)
 			elseif token == '[' then  -- `[' exp1 `]'
 				local key
 				luaK_exp2anyreg(fs, v)
-				yindex(ls, key)
+				yindex(key)
 				luaK_indexed(fs, v, key)
 			elseif token == ':' then  -- `:' NAME funcargs
 				local key
-				lexer:next()
-				checkname(ls, key)
+				next()
+				checkname(key)
 				luaK_self(fs, v, key)
-				funcargs(ls, v)
-			elseif token == '(' or token == 'string' or token == 'then' then --funcargs
-				luaK_exp2nextreg(fs, v)
-				funcargs(ls, v)
+				funcargs(v)
+			elseif token == '(' or token == '<string>' or token == 'then' then --funcargs
+				--luaK_exp2nextreg(fs, v)
+				funcargs(v)
 			else
 				return
 			end
@@ -965,210 +945,137 @@ local function parser(lexer)
 
 	-- NUMBER | STRING | NIL | true | false | ... | constructor | FUNCTION body | primaryexp
 	local function simpleexp(v)
-		if token == 'number' then
-			init_exp(v, VKNUM, 0)
-			v.u.nval = ls.t.seminfo.r
-		elseif token == 'string' then
-			codestring(ls, v, ls.t.seminfo.ts)
+		if token == '<number>' then
+			init_exp(v, 'number', token_val)
+		elseif token == '<string>' then
+			codestring(v, token_val)
 		elseif token == 'nil' then
-			init_exp(v, VNIL, 0)
+			init_exp(v, 'nil', 0)
 		elseif token == 'true' then
-			init_exp(v, VTRUE, 0)
+			init_exp(v, 'true', 0)
 		elseif token == 'false' then
-			init_exp(v, VFALSE, 0)
-		elseif token == 'dots' then  -- vararg
-			local fs = ls.fs
-			check_condition(ls, fs.f.is_vararg,
-								 'cannot use "..." outside a vararg function')
-			fs.f.is_vararg = bit.band(fs.f.is_vararg, bit.bnot(VARARG_NEEDSARG))  -- don't need 'arg'
-			init_exp(v, VVARARG, luaK_codeABC(fs, OP_VARARG, 0, 1, 0))
+			init_exp(v, 'false', 0)
+		elseif token == '...' then  -- vararg
+			checkif(fs.is_vararg, 'cannot use "..." outside a vararg function')
+			fs.is_vararg = bit.band(fs.is_vararg, bit.bnot(VARARG_NEEDSARG))  -- don't need 'arg'
+			init_exp(v, 'vararg', nil) --luaK_codeABC(fs, OP_VARARG, 0, 1, 0))
 		elseif token == '{' then -- constructor
-			constructor(ls, v)
+			constructor(v)
 			return
 		elseif token == 'function' then
-			lexer:next()
-			body(ls, v, 0, ls.linenumber)
+			next()
+			body(v, false, linenumber)
 			return
 		else
-			primaryexp(ls, v)
+			primaryexp(v)
 			return
 		end
-		lexer:next()
+		next()
 	end
 
-	local function getunopr(op)
-		if op == 'not' then
-			return 'not' --omonym but kept for validation
-		elseif op == '-' then
-			return 'minus'
-		elseif op == '#' then
-			return 'len'
-		end
-	end
-
-	local ops = {
-		['+'] = 'add',
-		['-'] = 'sub',
-		['*'] = 'mul',
-		['/'] = 'div',
-		['%'] = 'mod',
-		['^'] = 'pow',
-		['<'] = 'lt',
-		['>'] = 'gt',
-		--omonyms, but kept for validation
-		concat = 'concat',
-		ne = 'ne',
-		eq = 'eq',
-		le = 'le',
-		ge = 'ge',
-		['and'] = 'and',
-		['or'] = 'or',
-	}
-	local function getbinopr(op)
-		return ops[op] or op
-	end
-
-	ffi.cdef[[
-	static const struct {
-		lu_byte left;  /* left priority for each binary operator */
-		lu_byte right; /* right priority */
-	} priority[] = {  /* ORDER OPR */
-		{6, 6}, {6, 6}, {7, 7}, {7, 7}, {7, 7},  /* `+' `-' `/' `%' */
-		{10, 9}, {5, 4},                 /* power and concat (right associative) */
-		{3, 3}, {3, 3},                  /* equality and inequality */
-		{3, 3}, {3, 3}, {3, 3}, {3, 3},  /* order */
-		{2, 2}, {1, 1}                   /* logical (and/or) */
-	};
-	]]
+	local priority = {}
+	priority['+'  ] = {left = 6, right = 6}
+	priority['-'  ] = {left = 6, right = 6}
+	priority['*'  ] = {left = 7, right = 7}
+	priority['/'  ] = {left = 7, right = 7}
+	priority['%'  ] = {left = 7, right = 7}
+	priority['^'  ] = {left =10, right = 9} --right associative
+	priority['..' ] = {left = 5, right = 4} --right associative
+	priority['~=' ] = {left = 3, right = 3}
+	priority['==' ] = {left = 3, right = 3}
+	priority['<'  ] = {left = 3, right = 3}
+	priority['<=' ] = {left = 3, right = 3}
+	priority['>'  ] = {left = 3, right = 3}
+	priority['>=' ] = {left = 3, right = 3}
+	priority['and'] = {left = 2, right = 2}
+	priority['or' ] = {left = 1, right = 1}
 
 	local UNARY_PRIORITY = 8 -- priority for unary operators
 
-	-- subexpr . (simpleexp | unop subexpr) then binop subexpr end
+	-- (simpleexp | unop subexpr) { binop subexpr }
 	-- where `binop' is any binary operator with a priority higher than `limit'
-
 	local function subexpr(v, limit)
-		local op
-		local uop = getunopr(token)
-		if uop then
-			lexer:next()
-			subexpr(ls, v, UNARY_PRIORITY)
-			luaK_prefix(ls.fs, uop, v)
+		local uop = token
+		if uop == 'not' or uop == '-' or uop == '#' then
+			print('unary op', token, token_val)
+			next()
+			subexpr(v, UNARY_PRIORITY)
+			--print('prefix', uop)
+			--luaK_prefix(fs, uop, v)
 		else
-			simpleexp(ls, v)
+			simpleexp(v)
 		end
 		-- expand while operators have priorities higher than `limit'
-		op = getbinopr(token)
-		while op ~= OPR_NOBINOPR and priority[op].left > limit do
-			local v2
-			local nextop
-			lexer:next()
-			luaK_infix(ls.fs, op, v)
+		local op = token
+		local pri = priority[op]
+		while pri and pri.left > limit do
+			print('binary op', op)
+			local v2 = {}
+			next()
+			--luaK_infix(fs, op, v)
 			-- read sub-expression with higher priority
-			nextop = subexpr(ls, v2, priority[op].right)
-			luaK_posfix(ls.fs, op, v, v2)
+			local nextop = subexpr(v2, pri.right)
+			--luaK_posfix(fs, op, v, v2)
 			op = nextop
+			pri = priority[op]
 		end
 		return op  -- return first untreated operator
 	end
 
-	local function expr(v)
-		subexpr(ls, v, 0)
+	function expr(v)
+		subexpr(v, 0)
 	end
 
 	--Rules for statements ----------------------------------------------------
 
 	local function block() -- chunk
-		local fs = ls.fs
-		local bl
-		enterblock(fs, bl, 0)
-		chunk(ls)
+		print'block'
+		local bl = {}
+		enterblock(fs, bl, false)
+		chunk()
 		assert(bl.breaklist == NO_JUMP)
 		leaveblock(fs)
 	end
 
-
-	-- structure to chain all variables in the left-hand side of an
-	-- assignment
-
-	--LHS_assign {
-	--	prev
-	--	v  -- expdesc: variable (global, local, upvalue, or indexed)
-	--}
-
-
-	-- check whether, in an assignment to a local variable, the local variable
-	-- is needed in a previous assignment (to a table). If so, save original
-	-- local value in a safe place and use this safe copy in the previous
-	-- assignment.
-
-	local function check_conflict(lh, v)
-		local fs = ls.fs
-		local extra = fs.freereg  -- eventual position to save local variable
-		local conflict = 0
-		while lh do
-			if lh.v.k == VINDEXED then
-				if lh.v.u.s.info == v.u.s.info then  -- conflict?
-					conflict = 1
-					lh.v.u.s.info = extra  -- previous assignment will use safe copy
-				end
-				if lh.v.u.s.aux == v.u.s.info then  -- conflict?
-					conflict = 1
-					lh.v.u.s.aux = extra  -- previous assignment will use safe copy
-				end
-			end
-			lh = lh.prev
-		end
-		if conflict then
-			luaK_codeABC(fs, OP_MOVE, fs.freereg, v.u.s.info, 0)  -- make copy
-			luaK_reserveregs(fs, 1)
-		end
-	end
-
-
 	local function assignment(lh, nvars)
 		local e
-		check_condition(ls, VLOCAL <= lh.v.k and lh.v.k <= VINDEXED, "syntax error")
-		if testnext',' then  -- assignment . `,' primaryexp assignment
+		--TODO: checkif(VLOCAL <= lh.v.k and lh.v.k <= VINDEXED, "syntax error")
+		if nextif',' then  -- assignment . `,' primaryexp assignment
 			local nv
 			nv.prev = lh
-			primaryexp(ls, nv.v)
-			if nv.v.k == VLOCAL then
-				check_conflict(ls, lh, nv.v)
-			end
-			assignment(ls, nv, nvars+1)
+			primaryexp(nv.v)
+			assignment(nv, nvars+1)
 		else -- assignment . `=' explist1
-			local nexps
-			checknext(ls, '=')
-			nexps = explist1(ls, e)
+			check'='; next()
+			local nexps = explist1(e)
 			if nexps ~= nvars then
-				adjust_assign(ls, nvars, nexps, e)
+				adjust_assign(nvars, nexps, e)
 				if nexps > nvars then
-					ls.fs.freereg = ls.fs.freereg - (nexps - nvars)  -- remove extra values
+					fs.freereg = fs.freereg - (nexps - nvars)  -- remove extra values
 				end
 			else
-				luaK_setoneret(ls.fs, e)  -- close last expression
-				luaK_storevar(ls.fs, lh.v, e)
+				--luaK_setoneret(fs, e)  -- close last expression
+				--luaK_storevar(fs, lh.v, e)
 				return  -- avoid default
 			end
 		end
-		init_exp(e, VNONRELOC, ls.fs.freereg-1)  -- default assignment
-		luaK_storevar(ls.fs, lh.v, e)
+		init_exp(e, 'noreloc', fs.freereg-1)  -- default assignment
+		--luaK_storevar(fs, lh.v, e)
 	end
 
 
 	local function cond() -- exp
-		local v
-		expr(ls, v)  -- read condition
-		if v.k == VNIL then
-			v.k = VFALSE
+		local v = {}
+		expr(v)  -- read condition
+		if v.k == 'nil' then
+			v.k = 'false'
 		end -- `falses' are all equal here
-		luaK_goiftrue(ls.fs, v)
+		--luaK_goiftrue(fs, v)
 		return v.f
 	end
 
 
 	local function breakstat()
-		local fs = ls.fs
 		local bl = fs.bl
 		local upval = 0
 		while bl and not bl.isbreakable do
@@ -1176,28 +1083,26 @@ local function parser(lexer)
 			bl = bl.previous
 		end
 		if not bl then
-			syntaxerror("no loop to break")
+			syntaxerror'no loop to break'
 		end
 		if upval then
-			luaK_codeABC(fs, OP_CLOSE, bl.nactvar, 0, 0)
+			--luaK_codeABC(fs, OP_CLOSE, bl.nactvar, 0, 0)
 		end
-		luaK_concat(fs, bl.breaklist, luaK_jump(fs))
+		--luaK_concat(fs, bl.breaklist, luaK_jump(fs))
 	end
 
-
 	local function whilestat(line) -- WHILE cond DO block END
-		local fs = ls.fs
 		local whileinit
 		local condexit
 		local bl
-		lexer:next()  -- skip WHILE
+		next()  -- skip WHILE
 		whileinit = luaK_getlabel(fs)
-		condexit = cond(ls)
-		enterblock(fs, bl, 1)
-		checknext(ls, TK_DO)
-		block(ls)
+		condexit = cond()
+		enterblock(fs, bl, true)
+		check'do'; next()
+		block()
 		luaK_patchlist(fs, luaK_jump(fs), whileinit)
-		check_match(ls, TK_END, TK_WHILE, line)
+		check_match('end', 'while', line)
 		leaveblock(fs)
 		luaK_patchtohere(fs, condexit)  -- false conditions finish the loop
 	end
@@ -1205,23 +1110,22 @@ local function parser(lexer)
 
 	local function repeatstat(line) -- REPEAT block UNTIL cond
 		local condexit
-		local fs = ls.fs
 		local repeat_init = luaK_getlabel(fs)
 		local bl1, bl2
-		enterblock(fs, bl1, 1)  -- loop block
-		enterblock(fs, bl2, 0)  -- scope block
-		lexer:next()  -- skip REPEAT
-		chunk(ls)
-		check_match(ls, TK_UNTIL, TK_REPEAT, line)
-		condexit = cond(ls)  -- read condition (inside scope block)
+		enterblock(fs, bl1, true)  -- loop block
+		enterblock(fs, bl2, false)  -- scope block
+		next()  -- skip REPEAT
+		chunk()
+		check_match('until', 'repeat', line)
+		condexit = cond()  -- read condition (inside scope block)
 		if not bl2.upval then  -- no upvalues?
 			leaveblock(fs)  -- finish scope
-			luaK_patchlist(ls.fs, condexit, repeat_init)  -- close the loop
+			luaK_patchlist(fs, condexit, repeat_init)  -- close the loop
 		else -- complete semantics when there are upvalues
-			breakstat(ls)  -- if condition then break
-			luaK_patchtohere(ls.fs, condexit)  -- else...
+			breakstat()  -- if condition then break
+			luaK_patchtohere(fs, condexit)  -- else...
 			leaveblock(fs)  -- finish scope...
-			luaK_patchlist(ls.fs, luaK_jump(fs), repeat_init)  -- and repeat
+			luaK_patchlist(fs, luaK_jump(fs), repeat_init)  -- and repeat
 		end
 		leaveblock(fs)  -- finish loop
 	end
@@ -1229,173 +1133,163 @@ local function parser(lexer)
 	local function exp1()
 		local e
 		local k
-		expr(ls, e)
+		expr(e)
 		k = e.k
-		luaK_exp2nextreg(ls.fs, e)
+		--luaK_exp2nextreg(fs, e)
 		return k
 	end
 
 	local function forbody(base, line, nvars, isnum) -- forbody -> DO block
 		local bl
-		local fs = ls.fs
 		local prep, endfor
-		adjustlocalvars(ls, 3)  -- control variables
-		checknext(ls, TK_DO)
+		adjustlocalvars(3)  -- control variables
+		check'do'; next()
 		prep = isnum and luaK_codeAsBx(fs, OP_FORPREP, base, NO_JUMP) or luaK_jump(fs)
-		enterblock(fs, bl, 0)  -- scope for declared variables
-		adjustlocalvars(ls, nvars)
-		luaK_reserveregs(fs, nvars)
-		block(ls)
+		enterblock(fs, bl, false)  -- scope for declared variables
+		adjustlocalvars(nvars)
+		--luaK_reserveregs(fs, nvars)
+		block()
 		leaveblock(fs)  -- end of scope for declared variables
-		luaK_patchtohere(fs, prep)
-		endfor = isnum and luaK_codeAsBx(fs, OP_FORLOOP, base, NO_JUMP) or
-								luaK_codeABC(fs, OP_TFORLOOP, base, 0, nvars)
-		luaK_fixline(fs, line)  -- pretend that `OP_FOR' starts the loop
-		luaK_patchlist(fs, (isnum and endfor or luaK_jump(fs)), prep + 1)
+		--luaK_patchtohere(fs, prep)
+		--endfor = isnum and luaK_codeAsBx(fs, OP_FORLOOP, base, NO_JUMP) or
+		--						luaK_codeABC(fs, OP_TFORLOOP, base, 0, nvars)
+		--luaK_fixline(fs, line)  -- pretend that `OP_FOR' starts the loop
+		--luaK_patchlist(fs, (isnum and endfor or luaK_jump(fs)), prep + 1)
 	end
 
 
 	-- fornum -> NAME = exp1,exp1[,exp1] forbody
 	local function fornum(varname, line)
-		local fs = ls.fs
 		local base = fs.freereg
-		new_localvarliteral(ls, "(for index)", 0)
-		new_localvarliteral(ls, "(for limit)", 1)
-		new_localvarliteral(ls, "(for step)", 2)
-		new_localvar(ls, varname, 3)
-		checknext(ls, '=')
-		exp1(ls)  -- initial value
-		checknext(ls, ',')
-		exp1(ls)  -- limit
-		if testnext',' then
-			exp1(ls)  -- optional step
+		new_localvarliteral('(for index)', 0)
+		new_localvarliteral('(for limit)', 1)
+		new_localvarliteral('(for step)', 2)
+		new_localvar(varname, 3)
+		check'='; next()
+		exp1()  -- initial value
+		check','; next()
+		exp1()  -- limit
+		if nextif',' then
+			exp1()  -- optional step
 		else -- default step = 1
 			luaK_codeABx(fs, OP_LOADK, fs.freereg, luaK_numberK(fs, 1))
 			luaK_reserveregs(fs, 1)
 		end
-		forbody(ls, base, line, 1, 1)
+		forbody(base, line, 1, 1)
 	end
-
 
 	-- forlist -> NAME {,NAME} IN explist1 forbody
 	local function forlist(indexname)
-		local fs = ls.fs
 		local e
 		local nvars = 0
 		local line
 		local base = fs.freereg
 		-- create control variables
-		new_localvarliteral(ls, "(for generator)", nvars); nvars = nvars + 1
-		new_localvarliteral(ls, "(for state)", nvars); nvars = nvars + 1
-		new_localvarliteral(ls, "(for control)", nvars); nvars = nvars + 1
+		new_localvarliteral('(for generator)', nvars); nvars = nvars + 1
+		new_localvarliteral('(for state)', nvars); nvars = nvars + 1
+		new_localvarliteral('(for control)', nvars); nvars = nvars + 1
 		-- create declared variables
-		new_localvar(ls, indexname, nvars); nvars = nvars + 1
-		while testnext',' do
-			new_localvar(str_checkname(), nvars); nvars = nvars + 1
+		new_localvar(indexname, nvars); nvars = nvars + 1
+		while nextif',' do
+			new_localvar(checkname(), nvars); nvars = nvars + 1
 		end
-		checknext(ls, TK_IN)
-		line = ls.linenumber
-		adjust_assign(ls, 3, explist1(ls, e), e)
+		check'in'; next()
+		line = linenumber
+		adjust_assign(3, explist1(e), e)
 		luaK_checkstack(fs, 3)  -- extra space to call generator
-		forbody(ls, base, line, nvars - 3, 0)
+		forbody(base, line, nvars - 3, 0)
 	end
 
-
-	local function forstat(line) -- forstat -> FOR (fornum | forlist) END
-		local fs = ls.fs
+	local function forstat(line) -- FOR (fornum | forlist) END
 		local varname
 		local bl
-		enterblock(fs, bl, 1)  -- scope for loop and control variables
-		lexer:next()  -- skip `for'
-		varname = str_checkname(ls)  -- first variable name
+		enterblock(fs, bl, true)  -- scope for loop and control variables
+		next()  -- skip `for'
+		varname = checkname()  -- first variable name
 		if token == '=' then
-			fornum(ls, varname, line)
+			fornum(varname, line)
 		elseif token == ',' or token == 'in' then
-			forlist(ls, varname)
+			forlist(varname)
 		else
-			syntaxerror'"=" or "in" expected'
+			syntaxerror'\'=\' or \'in\' expected'
 		end
-		check_match(ls, TK_END, TK_FOR, line)
+		check_match('end', 'for', line)
 		leaveblock(fs)  -- loop scope (`break' jumps to this point)
 	end
 
-
-	-- test_then_block -> [IF | ELSEIF] cond THEN block
-	local function test_then_block()
+	local function test_then_block() -- [IF | ELSEIF] cond THEN block
 		local condexit
-		lexer:next()  -- skip IF or ELSEIF
-		condexit = cond(ls)
-		checknext(ls, TK_THEN)
-		block(ls)  -- `then' part
+		next()  -- skip IF or ELSEIF
+		condexit = cond()
+		check'then'; next()
+		block()  -- `then' part
 		return condexit
 	end
 
-
-	-- ifstat -> IF cond THEN block {ELSEIF cond THEN block} [ELSE block] END
+	-- IF cond THEN block {ELSEIF cond THEN block} [ELSE block] END
 	local function ifstat(line)
-		local fs = ls.fs
-		local flist
+		print'if'
+		local flist = {}
 		local escapelist = NO_JUMP
-		flist = test_then_block(ls)  -- IF cond THEN block
+		flist = test_then_block()  -- IF cond THEN block
 		while token == 'elseif' do
-			luaK_concat(fs, escapelist, luaK_jump(fs))
-			luaK_patchtohere(fs, flist)
-			flist = test_then_block(ls)  -- ELSEIF cond THEN block
+			--luaK_concat(fs, escapelist, luaK_jump(fs))
+			--luaK_patchtohere(fs, flist)
+			flist = test_then_block()  -- ELSEIF cond THEN block
 		end
 		if token == 'else' then
-			luaK_concat(fs, escapelist, luaK_jump(fs))
-			luaK_patchtohere(fs, flist)
-			lexer:next()  -- skip ELSE (after patch, for correct line info)
-			block(ls)  -- `else' part
+			--luaK_concat(fs, escapelist, luaK_jump(fs))
+			--luaK_patchtohere(fs, flist)
+			next()  -- skip ELSE (after patch, for correct line info)
+			block()  -- `else' part
 		else
-			luaK_concat(fs, escapelist, flist)
+			--luaK_concat(fs, escapelist, flist)
 		end
-		luaK_patchtohere(fs, escapelist)
-		check_match(ls, TK_END, TK_IF, line)
+		--luaK_patchtohere(fs, escapelist)
+		check_match('end', 'if', line)
 	end
 
 
 	local function localfunc()
 		local v, b
-		local fs = ls.fs
-		new_localvar(ls, str_checkname(ls), 0)
-		init_exp(v, VLOCAL, fs.freereg)
-		luaK_reserveregs(fs, 1)
-		adjustlocalvars(ls, 1)
-		body(ls, b, 0, ls.linenumber)
-		luaK_storevar(fs, v, b)
+		new_localvar(checkname(), 0)
+		init_exp(v, 'local', fs.freereg)
+		--luaK_reserveregs(fs, 1)
+		adjustlocalvars(1)
+		body(b, false, linenumber)
+		--luaK_storevar(fs, v, b)
 		-- debug information will only see the variable after this point!
-		getlocvar(fs, fs.nactvar - 1).startpc = fs.pc
+		--getlocvar(fs, fs.nactvar - 1).startpc = fs.pc
 	end
 
 
-	local function localstat() -- stat -> LOCAL NAME {`,' NAME} [`=' explist1]
+	local function localstat() -- LOCAL NAME {`,' NAME} [`=' explist1]
 		local nvars = 0
 		local nexps
-		local e
+		local e = {}
 		repeat
-			new_localvar(ls, str_checkname(ls), nvars); nvars = nvars + 1
-		until not testnext','
-		if testnext'=' then
-			nexps = explist1(ls, e)
+			new_localvar(checkname(), nvars); nvars = nvars + 1
+		until not nextif','
+		if nextif'=' then
+			nexps = explist1(e)
 		else
-			e.k = VVOID
+			e.k = 'void'
 			nexps = 0
 		end
-		adjust_assign(ls, nvars, nexps, e)
-		adjustlocalvars(ls, nvars)
+		adjust_assign(nvars, nexps, e)
+		adjustlocalvars(nvars)
 	end
 
 
 	local function funcname(v) -- funcname -> NAME thenfieldend [`:' NAME]
 		local needself = 0
-		singlevar(ls, v)
+		singlevar(v)
 		while token == '.' do
-			field(ls, v)
+			field(v)
 		end
 		if token == ':' then
 			needself = 1
-			field(ls, v)
+			field(v)
 		end
 		return needself
 	end
@@ -1404,35 +1298,34 @@ local function parser(lexer)
 	local function funcstat(line) -- funcstat -> FUNCTION funcname body
 		local needself
 		local v, b
-		lexer:next()  -- skip FUNCTION
-		needself = funcname(ls, v)
-		body(ls, b, needself, line)
-		luaK_storevar(ls.fs, v, b)
-		luaK_fixline(ls.fs, line)  -- definition `happens' in the first line
+		next()  -- skip FUNCTION
+		needself = funcname(v)
+		body(b, needself, line)
+		--luaK_storevar(fs, v, b)
+		--luaK_fixline(fs, line)  -- definition `happens' in the first line
 	end
 
 
-	local function exprstat() -- stat -> func | assignment
-		local fs = ls.fs
-		local v
-		primaryexp(ls, v.v)
-		if v.v.k == VCALL then  -- stat . func
-			SETARG_C(getcode(fs, v.v), 1)  -- call statement uses no results
-		else -- stat . assignment
+	local function exprstat() -- func | assignment
+		local v = {v = {}}
+		primaryexp(v.v)
+		if v.v.k == 'call' then  -- func
+			--SETARG_C(getcode(fs, v.v), 1)  -- call statement uses no results
+		else -- assignment
 			v.prev = nil
-			assignment(ls, v, 1)
+			assignment(v, 1)
 		end
 	end
 
 	local function block_follow()
 		return token == 'else' or token == 'elseif' or token == 'end'
-			or token == 'until' or token == 'eos'
+			or token == 'until' or token == '<eos>'
 	end
 
 	local function retstat() -- stat -> RETURN explist
 		local e --expdesc
 		local first, nret  -- registers with returned values
-		lexer:next() -- skip RETURN
+		next() -- skip RETURN
 		if block_follow() or token == ';' then
 			first = 0
 			nret = 0  -- return no values
@@ -1440,7 +1333,7 @@ local function parser(lexer)
 			nret = explist1(e)  -- optional return values
 			if hasmultret(e.k) then
 				luaK_setmultret(fs, e)
-				if e.k == VCALL and nret == 1 then  -- tail call?
+				if e.k == 'vcall' and nret == 1 then  -- tail call?
 					--
 				end
 				first = fs.nactvar
@@ -1449,77 +1342,63 @@ local function parser(lexer)
 				if nret == 1 then  -- only one single value?
 					first = luaK_exp2anyreg(fs, e)
 				else
-					luaK_exp2nextreg(fs, e)  -- values must go to the `stack'
+					--luaK_exp2nextreg(fs, e)  -- values must go to the `stack'
 					first = fs.nactvar  -- return all `active' values
 					assert(nret == fs.freereg - first)
 				end
 			end
 		end
-		luaK_ret(fs, first, nret)
+		--luaK_ret(fs, first, nret)
 	end
 
 	local function statement()
-		local line = linenumber  -- may be needed for error messages
-		if token == 'if' then  -- stat -> ifstat
-			ifstat(ls, line)
-			return false
-		elseif token == 'while' then -- stat -> whilestat
-			whilestat(ls, line)
-			return false
-		elseif token == 'do' then  -- stat -> DO block END
-			lexer:next()  -- skip DO
+		print('statement', token, token_val or '')
+		local line = linenumber  -- needed for error messages
+		if token == 'if' then
+			ifstat(line)
+		elseif token == 'while' then
+			whilestat(line)
+		elseif token == 'do' then  -- DO block END
+			next()  -- skip DO
 			block()
 			check_match('end', 'do', line)
-			return false
-		elseif token == 'for' then  -- stat -> forstat
+		elseif token == 'for' then
 			forstat(line)
-			return false
-		elseif token == 'repeat' then  -- stat -> repeatstat
+		elseif token == 'repeat' then
 			repeatstat(line)
-			return false
 		elseif token == 'function' then
-			funcstat(line)  -- stat -> funcstat
-			return false
-		elseif token == 'local' then  -- stat -> localstat
-			lexer:next()  -- skip LOCAL
-			if testnext'function' then -- local function?
+			funcstat(line)
+		elseif token == 'local' then
+			next()  -- skip LOCAL
+			if nextif'function' then -- local function?
 				localfunc()
 			else
 				localstat()
 			end
-			return false
-		elseif token == 'return' then -- stat -> retstat
+		elseif token == 'return' then
 			retstat()
 			return true  -- must be last statement
-		elseif token == 'break' then  -- stat -> breakstat
-			lexer:next()  -- skip BREAK
+		elseif token == 'break' then
+			next()  -- skip BREAK
 			breakstat()
 			return true  -- must be last statement
 		else
-			exprstat()
-			return false  -- to avoid warnings
+			exprstat() -- func | assignment
 		end
+		return false
 	end
 
-	local function chunk() -- { stat [`;'] }
-		local islast = 0
+	function chunk() -- { stat [`;'] }
+		local islast = false
 		while not islast and not block_follow() do
 			islast = statement()
-			testnext';'
+			nextif';'
 		end
 	end
 
-
-
-
-
-
-	local ls_fs
-
-	local function open_func(fs)
-		fs.prev = ls_fs  -- linked list of funcstates
-		ls_fs = fs
-		--[[
+	function open_func(new_fs)
+		new_fs.prev = fs  -- linked list of funcstates
+		fs = new_fs
 		fs.pc = 0
 		fs.lasttarget = -1
 		fs.jpc = NO_JUMP
@@ -1529,132 +1408,68 @@ local function parser(lexer)
 		fs.nlocvars = 0
 		fs.nactvar = 0
 		fs.bl = nil
-		f.source = ls.source
-		f.maxstacksize = 2  -- registers 0/1 are always valid
-		fs.h = luaH_new(L, 0, 0)
-		]]
+		fs.upvalues = {} --upvalues
+		fs.actvar = {} --declared-variable stack
+
+		--f
+		fs.k = nil
+		fs.sizek = 0
+		fs.p = nil
+		fs.sizep = 0
+		fs.code = nil
+		fs.sizecode = 0
+		fs.sizelineinfo = 0
+		fs.sizeupvalues = 0
+		fs.nups = 0
+		fs.upvalues = nil
+		fs.numparams = 0
+		fs.is_vararg = 0
+		fs.maxstacksize = 0
+		fs.lineinfo = nil
+		fs.sizelocvars = 0
+		fs.locvars = nil
+		fs.linedefined = 0
+		fs.lastlinedefined = 0
+		fs.source = nil
+		fs.locvars = {}
+		fs.p = {}
+
+		--fs.source = source
+		fs.maxstacksize = 2  -- registers 0/1 are always valid
+		fs.h = {}
 	end
 
-	local function close_func()
-		--[[
-		local fs = ls_fs
-		local f = fs.f
-		removevars(ls, 0)
-		luaK_ret(fs, 0, 0)  -- final return
-		luaM_reallocvector(L, f.code, f.sizecode, fs.pc, Instruction)
-		f.sizecode = fs.pc
-		luaM_reallocvector(L, f.lineinfo, f.sizelineinfo, fs.pc, int)
-		f.sizelineinfo = fs.pc
-		luaM_reallocvector(L, f.k, f.sizek, fs.nk, TValue)
-		f.sizek = fs.nk
-		luaM_reallocvector(L, f.p, f.sizep, fs.np, Proto *)
-		f.sizep = fs.np
-		luaM_reallocvector(L, f.locvars, f.sizelocvars, fs.nlocvars, LocVar)
-		f.sizelocvars = fs.nlocvars
-		luaM_reallocvector(L, f.upvalues, f.sizeupvalues, f.nups, TString *)
-		f.sizeupvalues = f.nups
-		assert(luaG_checkcode(f))
+	function close_func()
+		removevars(0)
+		fs.sizek = fs.nk
+		fs.sizep = fs.np
+		fs.sizelocvars = fs.nlocvars
+		fs.sizeupvalues = fs.nups
 		assert(fs.bl == nil)
-		]]
-		ls_fs = fs.prev
+		fs = fs.prev
 	end
 
-	local function parser()
+	local function parse()
 		local fs = {}
 		open_func(fs)
 		fs.is_vararg = VARARG_ISVARARG  -- main func. is always vararg
-		lex_next() -- read first token
+		next() -- read first token
 		chunk()
-		check'eos'
+		check'<eos>'
 		close_func()
-		assert(not funcstate.prev)
-		assert(funcstate.f.nups == 0)
-		assert(not ls_fs)
-		return funcstate.f
+		assert(not fs.prev)
+		assert(fs.nups == 0)
+		return fs
 	end
 
 	local par = {}
-	par.parser = parser
+	par.parse = parse
 
 	return par
 
 end
 
-
-if not ... then
-
-	local fs = require'fs'
-	local time = require'time'
-
-	local clock = time.clock()
-	local total_size = 0
-
-	local function lex(file)
-		local f = assert(fs.open(file))
-		local bufread = f:buffered_read()
-		local function read(buf, sz)
-			--return assert(bufread(buf, sz))
-			return assert(f:read(buf, sz))
-		end
-		local lexer = lexer(read, file)
-
-		while true do
-			local token, info, linenumber = lexer.next()
-			if token == 'eos' then break end
-		end
-
-		f:close()
-	end
-
-	local function parse(file)
-		local f = assert(fs.open(file))
-		local bufread = f:buffered_read()
-		local function read(buf, sz)
-			return assert(f:read(buf, sz))
-		end
-		local lexer = lexer(read, file)
-		local parser = parser(lexer)
-
-		parser:parse()
-
-		f:close()
-	end
-
-	local files = 0
-	for f,d in fs.dir() do
-		if d:is'file' and f:find'%.lua$' then
-			if f ~= 'harfbuzz_ot_demo.lua' and not f:find'^_' then
-				print(f)
-				total_size = total_size + d:attr'size'
-				files = files + 1
-				--os.execute([[bin\mingw64\luajit.exe -b ]]..f..' _'..f)
-				local ok, err
-				if false then
-					ok, err = loadfile(f)
-				elseif false then
-					ok, err = xpcall(lex, debug.traceback, f)
-				else
-					ok, err = xpcall(parse, debug.traceback, f)
-				end
-				if not ok then
-					print(f, ok, err)
-					break
-				end
-			end
-		end
-	end
-
-	local size = total_size / 1024 / 1024
-	local duration = time.clock() - clock
-	local speed = size / duration
-	print(string.format('%d files, %.1f MB, %.1fs, %d MB/s',
-		files, size, duration, speed))
-
-
-	return parser
-end
-
-
 return {
 	lexer = lexer,
+	parser = parser,
 }
