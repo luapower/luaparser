@@ -14,6 +14,7 @@ local isalnum = ljs.isalnum
 local isspace = ljs.isspace
 local isdigit = ljs.isdigit
 local isalpha = ljs.isalpha
+local strscan = ljs.strscan
 
 local function isnewline(c)
 	return c == 10 or c == 13
@@ -193,7 +194,7 @@ local function lexer(read, source)
 			save_and_nextchar()
 		end
 		save(0)
-		return ljs.strscan(buf)
+		return strscan(buf)
 	end
 
 
@@ -414,18 +415,38 @@ local function lexer(read, source)
 		return lookahead_token, lookahead_info, linenumber
 	end
 
+	function lexer:error(msg, token)
+		lexerror(msg, token)
+	end
+
 	return lexer
 end
 
 --parser ---------------------------------------------------------------------
 
+local VARARG_HASARG   = 1
+local VARARG_ISVARARG = 2
+local VARARG_NEEDSARG = 4
+
 local function parser(lexer)
 
 	local token, info, linenumber
 
+	local function lex_next()
+		token, info, linenumber = lexer:next()
+	end
+
+	local function syntaxerror(msg, token)
+		return lexer:error(msg, token)
+	end
+
+	local function token2str(token)
+		return tokens[token] or token
+	end
+
 	local function testnext(c)
 		if token == c then
-			token, info, linenumber = lexer:next()
+			lex_next()
 			return true
 		else
 			return false
@@ -437,15 +458,16 @@ local function parser(lexer)
 			if where == linenumber then
 				error_expected(what)
 			else
-				syntaxerror(luaO_pushfstring('"%s" expected (to close "%s" at line %d)',
-						luaX_token2str(ls, what), luaX_token2str(ls, who), where))
+				syntaxerror(string.format(
+					'"%s" expected (to close "%s" at line %d)',
+						token2str(what), token2str(who), where))
 			end
 		end
 	end
 
-	#define hasmultret(k)		((k) == VCALL or (k) == VVARARG)
+	--#define hasmultret(k)		((k) == VCALL or (k) == VVARARG)
 
-	#define getlocvar(fs, i)	((fs).f.locvars[(fs).actvar[i]])
+	--#define getlocvar(fs, i)	((fs).f.locvars[(fs).actvar[i]])
 
 	--nodes for block list (list of active blocks)
 	ffi.cdef[[
@@ -461,51 +483,43 @@ local function parser(lexer)
 	-- prototypes for recursive non-terminal functions
 	local chunk, expr --fw. decl.
 
-	local function anchor_token()
-		if token == 'name' or token == 'string' then
-		 TString *ts = ls.t.seminfo.ts
-		 luaX_newstring(ls, getstr(ts), ts.tsv.len)
-		end
-	end
-
-
 	local function error_expected(token)
-		syntaxerror(luaO_pushfstring(ls.L, LUA_QS " expected", luaX_token2str(ls, token)))
+		syntaxerror(string.format('"%s" expected', token2str(token)))
 	end
 
 
 	local function errorlimit(fs, limit, what)
-		const char *msg = (fs.f.linedefined == 0) ?
-		 luaO_pushfstring(fs.L, "main function has more than %d %s", limit, what) :
-		 luaO_pushfstring(fs.L, "function at line %d has more than %d %s",
+		local msg = (fs.f.linedefined == 0) and
+			luaO_pushfstring(fs.L, "main function has more than %d %s", limit, what) or
+			luaO_pushfstring(fs.L, "function at line %d has more than %d %s",
 										 fs.f.linedefined, limit, what)
 		luaX_lexerror(fs.ls, msg, 0)
 	end
 
 	local function check(c)
 		if token ~= c then
-			error_expected(ls, c)
+			error_expected(c)
 		end
 	end
 
 	local function checknext(c)
-		check(ls, c)
-		lexer:next()
+		check(c)
+		lex_next()
 	end
 
-	#define check_condition(ls,c,msg)	{ if (!(c)) syntaxerror(msg) }
+	--#define check_condition(ls,c,msg)	{ if (!(c)) syntaxerror(msg) }
 
 	local function str_checkname()
-		TString *ts
-		check(ls, TK_NAME)
-		ts = ls.t.seminfo.ts
-		lexer:next()
+		local s = check'name'
+		local ts = ls.t.seminfo.ts
+		lex_next()
 		return ts
 	end
 
 
-	local function init_exp(e, k, i) then
-		e.f = e.t = NO_JUMP
+	local function init_exp(e, k, i)
+		e.f = NO_JUMP
+		e.t = NO_JUMP
 		e.k = k
 		e.u.s.info = i
 	end
@@ -519,71 +533,76 @@ local function parser(lexer)
 	end
 
 	local function registerlocalvar(varname)
-		FuncState *fs = ls.fs
-		Proto *f = fs.f
-		int oldsize = f.sizelocvars
+		local fs = ls.fs
+		local f = fs.f
+		local oldsize = f.sizelocvars
 		luaM_growvector(ls.L, f.locvars, fs.nlocvars, f.sizelocvars,
 							LocVar, SHRT_MAX, "too many local variables")
-		while (oldsize < f.sizelocvars) do
-			f.locvars[oldsize++].varname = NULL
+		while oldsize < f.sizelocvars do
+			f.locvars[oldsize].varname = nil
+			oldsize = oldsize + 1
 		end
 		f.locvars[fs.nlocvars].varname = varname
 		luaC_objbarrier(ls.L, f, varname)
-		return fs.nlocvars++
+		local n = fs.nlocvars
+		fs.nlocvars = fs.nlocvars + 1
+		return n
 	end
 
-	#define new_localvarliteral(ls,v,n) \
-		new_localvar(ls, luaX_newstring(ls, "" v, (sizeof(v)/sizeof(char))-1), n)
+	--#define new_localvarliteral(ls,v,n) \
+		--new_localvar(ls, luaX_newstring(ls, "" v, (sizeof(v)/sizeof(char))-1), n)
 
 
 	local function new_localvar(name, n)
-		FuncState *fs = ls.fs
-		fs.actvar[fs.nactvar+n] = cast(unsigned short, registerlocalvar(ls, name))
+		local fs = ls.fs
+		fs.actvar[fs.nactvar+n] = ffi.cast('unsigned short', registerlocalvar(name))
 	end
 
 
-	local function adjustlocalvars(nvars) then
-		FuncState *fs = ls.fs
+	local function adjustlocalvars(nvars)
+		local fs = ls.fs
 		fs.nactvar = cast_byte(fs.nactvar + nvars)
-		for ( nvars nvars--) then
-		 getlocvar(fs, fs.nactvar - nvars).startpc = fs.pc
+		while nvars > 0 do
+			getlocvar(fs, fs.nactvar - nvars).startpc = fs.pc
+			nvars = nvars - 1
 		end
 	end
 
-	local function removevars (tolevel) then
-		FuncState *fs = ls.fs
-		while (fs.nactvar > tolevel) do
-		 fs.nactvar = fs.nactvar - 1
-		 getlocvar(fs, fs.nactvar).endpc = fs.pc
+	local function removevars(tolevel)
+		local fs = ls.fs
+		while fs.nactvar > tolevel do
+			fs.nactvar = fs.nactvar - 1
+			getlocvar(fs, fs.nactvar).endpc = fs.pc
 		end
 	end
 
 	local function indexupvalue(fs, name, v)
-		int i
-		Proto *f = fs.f
-		int oldsize = f.sizeupvalues
-		for (i=0 i<f.nups i++) do
-		 if (fs.upvalues[i].k == v.k and fs.upvalues[i].info == v.u.s.info) then
-			assert(f.upvalues[i] == name)
-			return i
-		 end
+		local i
+		local f = fs.f
+		local oldsize = f.sizeupvalues
+		for i=0,f.nups-1 do
+			if fs.upvalues[i].k == v.k and fs.upvalues[i].info == v.u.s.info then
+				assert(f.upvalues[i] == name)
+				return i
+			end
 		end
 		-- new one
-		luaM_growvector(fs.L, f.upvalues, f.nups, f.sizeupvalues,
-							TString *, MAX_INT, "")
-		while (oldsize < f.sizeupvalues) do
-			f.upvalues[oldsize++] = NULL
+		--TODO: luaM_growvector(fs.L, f.upvalues, f.nups, f.sizeupvalues, TString *, MAX_INT, "")
+		while oldsize < f.sizeupvalues do
+			f.upvalues[oldsize] = nil
+			oldsize = oldsize + 1
 		end
 		f.upvalues[f.nups] = name
 		luaC_objbarrier(fs.L, f, name)
 		assert(v.k == VLOCAL or v.k == VUPVAL)
 		fs.upvalues[f.nups].k = cast_byte(v.k)
 		fs.upvalues[f.nups].info = cast_byte(v.u.s.info)
-		return f.nups++
+		local n = f.nups
+		f.nups = f.nups + 1
+		return n
 	end
 
 	local function searchvar(fs, n)
-		int i
 		for i = fs.nactvar-1, 0, -1 do
 		 if n == getlocvar(fs, i).varname then
 			return i
@@ -592,60 +611,59 @@ local function parser(lexer)
 	end
 
 	local function markupval(fs, level)
-		BlockCnt *bl = fs.bl
-		while (bl and bl.nactvar > level) do
+		local bl = fs.bl
+		while bl and bl.nactvar > level do
 			bl = bl.previous
 		end
-		if (bl) then bl.upval = 1 end
+		if bl then bl.upval = 1 end
 	end
 
 	local function singlevaraux(fs, n, var, base)
-		if (fs == NULL) then  -- no more levels?
-		 init_exp(var, VGLOBAL, NO_REG)  -- default is global variable
-		 return VGLOBAL
-		end
-		else then
-		 int v = searchvar(fs, n)  -- look up at current level
-		 if (v >= 0) then
-			init_exp(var, VLOCAL, v)
-			if (!base)
-				markupval(fs, v)  -- local will be used as an upval
-			return VLOCAL
-		 end
-		 else then  -- not found at current level try upper one
-			if (singlevaraux(fs.prev, n, var, 0) == VGLOBAL)
-				return VGLOBAL
-			var.u.s.info = indexupvalue(fs, n, var)  -- else was LOCAL or UPVAL
-			var.k = VUPVAL  -- upvalue in this level
-			return VUPVAL
-		 end
+		if fs == nil then  -- no more levels?
+			init_exp(var, VGLOBAL, NO_REG)  -- default is global variable
+			return VGLOBAL
+		else
+			local v = searchvar(fs, n)  -- look up at current level
+			if v >= 0 then
+				init_exp(var, VLOCAL, v)
+				if not base then
+					markupval(fs, v)  -- local will be used as an upval
+				end
+				return VLOCAL
+			else -- not found at current level try upper one
+				if singlevaraux(fs.prev, n, var, 0) == VGLOBAL then
+					return VGLOBAL
+				end
+				var.u.s.info = indexupvalue(fs, n, var)  -- else was LOCAL or UPVAL
+				var.k = VUPVAL  -- upvalue in this level
+				return VUPVAL
+			end
 		end
 	end
 
 	local function singlevar(var)
-		TString *varname = str_checkname(ls)
-		FuncState *fs = ls.fs
-		if (singlevaraux(fs, varname, var, 1) == VGLOBAL) then
+		local varname = str_checkname(ls)
+		local fs = ls.fs
+		if singlevaraux(fs, varname, var, 1) == VGLOBAL then
 			var.u.s.info = luaK_stringK(fs, varname)  -- info points to global name
 		end
 	end
 
 	local function adjust_assign(nvars, nexps, e)
-		FuncState *fs = ls.fs
-		int extra = nvars - nexps
-		if (hasmultret(e.k)) then
-		 extra++  -- includes call itself
-		 if (extra < 0) extra = 0
-		 luaK_setreturns(fs, e, extra)  -- last exp. provides the difference
-		 if (extra > 1) luaK_reserveregs(fs, extra-1)
-		end
-		else then
-		 if (e.k ~= VVOID) luaK_exp2nextreg(fs, e)  -- close last expression
-		 if (extra > 0) then
-			int reg = fs.freereg
-			luaK_reserveregs(fs, extra)
-			luaK_nil(fs, reg, extra)
-		 end
+		local fs = ls.fs
+		local extra = nvars - nexps
+		if hasmultret(e.k) then
+			extra = extra + 1  -- includes call itself
+			if extra < 0 then extra = 0 end
+			luaK_setreturns(fs, e, extra)  -- last exp. provides the difference
+			if extra > 1 then luaK_reserveregs(fs, extra-1) end
+		else
+			if e.k ~= VVOID then luaK_exp2nextreg(fs, e) end -- close last expression
+			if extra > 0 then
+				local reg = fs.freereg
+				luaK_reserveregs(fs, extra)
+				luaK_nil(fs, reg, extra)
+			end
 		end
 	end
 
@@ -661,13 +679,14 @@ local function parser(lexer)
 	end
 
 	local function leaveblock(fs)
-		BlockCnt *bl = fs.bl
+		local bl = fs.bl
 		fs.bl = bl.previous
 		removevars(fs.ls, bl.nactvar)
-		if (bl.upval)
-		 luaK_codeABC(fs, OP_CLOSE, bl.nactvar, 0, 0)
+		if bl.upval then
+			luaK_codeABC(fs, OP_CLOSE, bl.nactvar, 0, 0)
+		end
 		-- a block either controls scope or breaks (never both)
-		assert(!bl.isbreakable or !bl.upval)
+		assert(not bl.isbreakable or not bl.upval)
 		assert(bl.nactvar == fs.nactvar)
 		fs.freereg = fs.nactvar  -- free registers
 		luaK_patchtohere(fs, bl.breaklist)
@@ -675,103 +694,34 @@ local function parser(lexer)
 
 
 	local function pushclosure(func, v)
-		FuncState *fs = ls.fs
-		Proto *f = fs.f
-		int oldsize = f.sizep
-		int i
-		luaM_growvector(ls.L, f.p, fs.np, f.sizep, Proto *,
-							MAXARG_Bx, "constant table overflow")
-		while (oldsize < f.sizep) do
-			f.p[oldsize++] = NULL
+		local fs = ls.fs
+		local f = fs.f
+		local oldsize = f.sizep
+		local i
+		--luaM_growvector(ls.L, f.p, fs.np, f.sizep, Proto *, MAXARG_Bx, "constant table overflow")
+		while oldsize < f.sizep do
+			f.p[oldsize] = nil
+			oldsize = oldsize + 1
 		end
-		f.p[fs.np++] = func.f
+		f.p[fs.np] = func.f
+		fs.np = fs.np + 1
 		luaC_objbarrier(ls.L, f, func.f)
 		init_exp(v, VRELOCABLE, luaK_codeABx(fs, OP_CLOSURE, 0, fs.np-1))
-		for (i=0 i<func.f.nups i++) then
-			OpCode o = (func.upvalues[i].k == VLOCAL) ? OP_MOVE : OP_GETUPVAL
+		for i = 0, func.f.nups-1 do
+			local o = func.upvalues[i].k == VLOCAL and OP_MOVE or OP_GETUPVAL
 			luaK_codeABC(fs, o, 0, func.upvalues[i].info, 0)
 		end
-	end
-
-	local function open_func(fs)
-		lua_State *L = ls.L
-		Proto *f = luaF_newproto(L)
-		fs.f = f
-		fs.prev = ls.fs  -- linked list of funcstates
-		fs.ls = ls
-		fs.L = L
-		ls.fs = fs
-		fs.pc = 0
-		fs.lasttarget = -1
-		fs.jpc = NO_JUMP
-		fs.freereg = 0
-		fs.nk = 0
-		fs.np = 0
-		fs.nlocvars = 0
-		fs.nactvar = 0
-		fs.bl = NULL
-		f.source = ls.source
-		f.maxstacksize = 2  -- registers 0/1 are always valid
-		fs.h = luaH_new(L, 0, 0)
-		-- anchor table of constants and prototype (to avoid being collected)
-		sethvalue2s(L, L.top, fs.h)
-		incr_top(L)
-		setptvalue2s(L, L.top, f)
-		incr_top(L)
-	end
-
-	local function close_func()
-		lua_State *L = ls.L
-		FuncState *fs = ls.fs
-		Proto *f = fs.f
-		removevars(ls, 0)
-		luaK_ret(fs, 0, 0)  -- final return
-		luaM_reallocvector(L, f.code, f.sizecode, fs.pc, Instruction)
-		f.sizecode = fs.pc
-		luaM_reallocvector(L, f.lineinfo, f.sizelineinfo, fs.pc, int)
-		f.sizelineinfo = fs.pc
-		luaM_reallocvector(L, f.k, f.sizek, fs.nk, TValue)
-		f.sizek = fs.nk
-		luaM_reallocvector(L, f.p, f.sizep, fs.np, Proto *)
-		f.sizep = fs.np
-		luaM_reallocvector(L, f.locvars, f.sizelocvars, fs.nlocvars, LocVar)
-		f.sizelocvars = fs.nlocvars
-		luaM_reallocvector(L, f.upvalues, f.sizeupvalues, f.nups, TString *)
-		f.sizeupvalues = f.nups
-		assert(luaG_checkcode(f))
-		assert(fs.bl == NULL)
-		ls.fs = fs.prev
-		-- last token read was anchored in defunct function must reanchor it
-		if (fs) then anchor_token(ls) end
-		L.top -= 2  -- remove table and prototype from the stack
-	end
-
-	local function parser()
-		struct LexState lexstate
-		struct FuncState funcstate
-		lexstate.buff = buff
-		luaX_setinput(L, &lexstate, z, luaS_new(L, name))
-		open_func(&lexstate, &funcstate)
-		funcstate.f.is_vararg = VARARG_ISVARARG  -- main func. is always vararg
-		luaX_next(&lexstate)  -- read first token
-		chunk(&lexstate)
-		check(&lexstate, TK_EOS)
-		close_func(&lexstate)
-		assert(funcstate.prev == NULL)
-		assert(funcstate.f.nups == 0)
-		assert(lexstate.fs == NULL)
-		return funcstate.f
 	end
 
 	-- GRAMMAR RULES ----------------------------------------------------------
 
 	local function field(v) -- ['.' | ':'] NAME
-		FuncState *fs = ls.fs
-		expdesc key
+		local fs = ls.fs
+		local key
 		luaK_exp2anyreg(fs, v)
-		lexer:next()  -- skip the dot or colon
-		checkname(ls, &key)
-		luaK_indexed(fs, v, &key)
+		lex_next()  -- skip the dot or colon
+		checkname(ls, key)
+		luaK_indexed(fs, v, key)
 	end
 
 	local function yindex(v)  -- '[' expr ']'
@@ -794,31 +744,31 @@ local function parser(lexer)
 	]]
 
 	local function recfield(cc) -- (NAME | `['exp1`]') = exp1
-		FuncState *fs = ls.fs
-		int reg = ls.fs.freereg
-		expdesc key, val
-		int rkkey
+		local fs = ls.fs
+		local reg = ls.fs.freereg
+		local key, val
+		local rkkey
 		if token == 'name' then
-			checkname(ls, &key)
+			checkname(key)
 		else -- token == '['
-			yindex(ls, &key)
+			yindex(key)
 		end
-		cc.nh++
-		checknext(ls, '=')
-		rkkey = luaK_exp2RK(fs, &key)
-		expr(ls, &val)
-		luaK_codeABC(fs, OP_SETTABLE, cc.t.u.s.info, rkkey, luaK_exp2RK(fs, &val))
+		cc.nh = cc.nh + 1
+		checknext'='
+		rkkey = luaK_exp2RK(fs, key)
+		expr(ls, val)
+		luaK_codeABC(fs, OP_SETTABLE, cc.t.u.s.info, rkkey, luaK_exp2RK(fs, val))
 		fs.freereg = reg  -- free registers
 	end
 
 
 	local function closelistfield(fs, cc)
 		if cc.v.k == VVOID then return end -- there is no list item
-		luaK_exp2nextreg(fs, &cc.v)
+		luaK_exp2nextreg(fs, cc.v)
 		cc.v.k = VVOID
 		if (cc.tostore == LFIELDS_PER_FLUSH) then
-		 luaK_setlist(fs, cc.t.u.s.info, cc.na, cc.tostore)  -- flush
-		 cc.tostore = 0  -- no more items pending
+			luaK_setlist(fs, cc.t.u.s.info, cc.na, cc.tostore)  -- flush
+			cc.tostore = 0  -- no more items pending
 		end
 	end
 
@@ -826,88 +776,85 @@ local function parser(lexer)
 	local function lastlistfield(fs, cc)
 		if cc.tostore == 0 then return end
 		if hasmultret(cc.v.k) then
-		 luaK_setmultret(fs, &cc.v)
-		 luaK_setlist(fs, cc.t.u.s.info, cc.na, LUA_MULTRET)
-		 cc.na--  -- do not count last expression (unknown number of elements)
+			luaK_setmultret(fs, cc.v)
+			luaK_setlist(fs, cc.t.u.s.info, cc.na, LUA_MULTRET)
+			cc.na = cc.na - 1 -- do not count last expression (unknown number of elements)
 		else
-		 if cc.v.k ~= VVOID then
-			luaK_exp2nextreg(fs, &cc.v)
-		 end
-		 luaK_setlist(fs, cc.t.u.s.info, cc.na, cc.tostore)
+			if cc.v.k ~= VVOID then
+				luaK_exp2nextreg(fs, cc.v)
+			end
+			luaK_setlist(fs, cc.t.u.s.info, cc.na, cc.tostore)
 		end
 	end
 
 	local function listfield(cc)
-		expr(ls, &cc.v)
-		cc.na++
-		cc.tostore++
+		expr(ls, cc.v)
+		cc.na = cc.na + 1
+		cc.tostore = cc.tostore + 1
 	end
 
 	local function constructor(t) -- ??
-		FuncState *fs = ls.fs
-		int line = ls.linenumber
-		int pc = luaK_codeABC(fs, OP_NEWTABLE, 0, 0, 0)
-		struct ConsControl cc
-		cc.na = cc.nh = cc.tostore = 0
+		local fs = ls.fs
+		local line = ls.linenumber
+		local pc = luaK_codeABC(fs, OP_NEWTABLE, 0, 0, 0)
+		local cc
+		cc.na = 0
+		cc.nh = 0
+		cc.tostore = 0
 		cc.t = t
 		init_exp(t, VRELOCABLE, pc)
-		init_exp(&cc.v, VVOID, 0)  -- no value (yet)
+		init_exp(cc.v, VVOID, 0)  -- no value (yet)
 		luaK_exp2nextreg(ls.fs, t)  -- fix it at stack top (for gc)
-		checknext(ls, 'then')
+		checknext'then'
 		repeat
-		 assert(cc.v.k == VVOID or cc.tostore > 0)
-		 if (token == 'end') break
-		 closelistfield(fs, &cc)
-		 switch(token) then
-			case TK_NAME: then  -- may be listfields or recfields
-				luaX_lookahead(ls)
-				if (ls.lookahead.token ~= '=')  -- expression?
-				 listfield(ls, &cc)
+			assert(cc.v.k == VVOID or cc.tostore > 0)
+			if token == 'end' then break end
+			closelistfield(fs, cc)
+			if token == 'name' then -- may be listfields or recfields
+				luaX_lookahead()
+				if ls.lookahead.token ~= '=' then  -- expression?
+					listfield(ls, cc)
 				else
-				 recfield(ls, &cc)
-				break
+					recfield(ls, cc)
+				end
+			elseif token == '[' then  -- constructor_item . recfield
+				recfield(ls, cc)
+			else -- constructor_part . listfield
+				listfield(ls, cc)
 			end
-			case '[': then  -- constructor_item . recfield
-				recfield(ls, &cc)
-				break
-			end
-			default: then  -- constructor_part . listfield
-				listfield(ls, &cc)
-				break
-			end
-		 end
 		until not (testnext',' or testnext'')
 		check_match(ls, 'end', 'then', line)
-		lastlistfield(fs, &cc)
+		lastlistfield(fs, cc)
 		SETARG_B(fs.f.code[pc], luaO_int2fb(cc.na)) -- set initial array size
 		SETARG_C(fs.f.code[pc], luaO_int2fb(cc.nh))  -- set initial table size
 	end
 
 	local function parlist()  -- [ param { `,' param } ]
-		FuncState *fs = ls.fs
-		Proto *f = fs.f
-		int nparams = 0
+		local fs = ls.fs
+		local f = fs.f
+		local nparams = 0
 		f.is_vararg = 0
 		if token ~= ')' then  -- is `parlist' not empty?
 			repeat
 				if token == 'name' then -- NAME
-					new_localvar(ls, str_checkname(ls), nparams++)
+					new_localvar(ls, str_checkname(ls), nparams)
+					nparams = nparams + 1
 				elseif token == 'dots' then  -- `...'
 					lexer:next()
-					f.is_vararg |= VARARG_ISVARARG
+					f.is_vararg = bit.bor(f.is_vararg, VARARG_ISVARARG)
 				else
-					syntaxerror("<name> or " LUA_QL("...") " expected")
+					syntaxerror('<name> or "..." expected')
 				end
-			until not (!f.is_vararg and testnext(ls, ','))
+			until not (not f.is_vararg and testnext',')
 		end
 		adjustlocalvars(ls, nparams)
-		f.numparams = cast_byte(fs.nactvar - (f.is_vararg & VARARG_HASARG))
+		f.numparams = cast_byte(fs.nactvar - bit.band(f.is_vararg, VARARG_HASARG))
 		luaK_reserveregs(fs, fs.nactvar)  -- reserve register for parameters
 	end
 
 	local function body(e, needself, line) -- `(' parlist `)' chunk END
-		FuncState new_fs
-		open_func(ls, &new_fs)
+		local new_fs
+		open_func(ls, new_fs)
 		new_fs.f.linedefined = line
 		checknext(ls, '(')
 		if needself then
@@ -920,13 +867,13 @@ local function parser(lexer)
 		new_fs.f.lastlinedefined = ls.linenumber
 		check_match(ls, TK_END, TK_FUNCTION, line)
 		close_func(ls)
-		pushclosure(ls, &new_fs, e)
+		pushclosure(ls, new_fs, e)
 	end
 
 	local function explist1(v) -- expr { `,' expr }
 		local n = 1  -- at least one expression
 		expr(ls, v)
-		while testnext',' then
+		while testnext',' do
 			luaK_exp2nextreg(ls.fs, v)
 			expr(ls, v)
 			n = n + 1
@@ -935,29 +882,27 @@ local function parser(lexer)
 	end
 
 	local function funcargs(f)
-		FuncState *fs = ls.fs
-		expdesc args
-		int base, nparams
-		int line = ls.linenumber
+		local fs = ls.fs
+		local args
+		local base, nparams
+		local line = ls.linenumber
 		if token == '(' then  -- `(' [ explist1 ] `)'
-			if (line ~= ls.lastline)
-				syntaxerror(ls,"ambiguous syntax (function call x new statement)")
+			if line ~= ls.lastline then
+				syntaxerror'ambiguous syntax (function call x new statement)'
+			end
 			lexer:next()
-			if (token == ')')  -- arg list is empty?
+			if token == ')' then  -- arg list is empty?
 				args.k = VVOID
-			else then
-				explist1(ls, &args)
-				luaK_setmultret(fs, &args)
+			else
+				explist1(ls, args)
+				luaK_setmultret(fs, args)
 			end
 			check_match(ls, ')', '(', line)
-			break
 		elseif token == 'then' then  -- constructor
-			constructor(ls, &args)
-			break
+			constructor(ls, args)
 		elseif token == 'string' then  -- STRING
-			codestring(ls, &args, ls.t.seminfo.ts)
+			codestring(ls, args, ls.t.seminfo.ts)
 			lexer:next()  -- must use `seminfo' before `next'
-			break
 		else
 			syntaxerror("function arguments expected")
 		end
@@ -966,7 +911,7 @@ local function parser(lexer)
 		if hasmultret(args.k) then
 			nparams = LUA_MULTRET  -- open call
 		elseif args.k ~= VVOID then
-			luaK_exp2nextreg(fs, &args)  -- close last argument
+			luaK_exp2nextreg(fs, args)  -- close last argument
 			nparams = fs.freereg - (base+1)
 		end
 		init_exp(f, VCALL, luaK_codeABC(fs, OP_CALL, base, nparams+1, 2))
@@ -978,7 +923,7 @@ local function parser(lexer)
 
 	local function prefixexp(v) -- NAME | '(' expr ')'
 		if token == '(' then
-			int line = ls.linenumber
+			local line = ls.linenumber
 			lexer:next()
 			expr(ls, v)
 			check_match(ls, ')', '(', line)
@@ -993,29 +938,25 @@ local function parser(lexer)
 
 	-- primaryexp -> prefixexp { `.' NAME | `[' exp `]' | `:' NAME funcargs | funcargs }
 	local function primaryexp(v)
-		FuncState *fs = ls.fs
+		local fs = ls.fs
 		prefixexp(ls, v)
 		while true do
 			if token == '.' then  -- field
 				field(ls, v)
-				break
 			elseif token == '[' then  -- `[' exp1 `]'
-				expdesc key
+				local key
 				luaK_exp2anyreg(fs, v)
-				yindex(ls, &key)
-				luaK_indexed(fs, v, &key)
-				break
+				yindex(ls, key)
+				luaK_indexed(fs, v, key)
 			elseif token == ':' then  -- `:' NAME funcargs
-				expdesc key
+				local key
 				lexer:next()
-				checkname(ls, &key)
-				luaK_self(fs, v, &key)
+				checkname(ls, key)
+				luaK_self(fs, v, key)
 				funcargs(ls, v)
-				break
 			elseif token == '(' or token == 'string' or token == 'then' then --funcargs
 				luaK_exp2nextreg(fs, v)
 				funcargs(ls, v)
-				break
 			else
 				return
 			end
@@ -1036,10 +977,10 @@ local function parser(lexer)
 		elseif token == 'false' then
 			init_exp(v, VFALSE, 0)
 		elseif token == 'dots' then  -- vararg
-			FuncState *fs = ls.fs
+			local fs = ls.fs
 			check_condition(ls, fs.f.is_vararg,
-								 "cannot use " LUA_QL("...") " outside a vararg function")
-			fs.f.is_vararg &= ~VARARG_NEEDSARG  -- don't need 'arg'
+								 'cannot use "..." outside a vararg function')
+			fs.f.is_vararg = bit.band(fs.f.is_vararg, bit.bnot(VARARG_NEEDSARG))  -- don't need 'arg'
 			init_exp(v, VVARARG, luaK_codeABC(fs, OP_VARARG, 0, 1, 0))
 		elseif token == '{' then -- constructor
 			constructor(ls, v)
@@ -1117,14 +1058,14 @@ local function parser(lexer)
 		end
 		-- expand while operators have priorities higher than `limit'
 		op = getbinopr(token)
-		while op ~= OPR_NOBINOPR and priority[op].left > limit then
-			expdesc v2
-			BinOpr nextop
+		while op ~= OPR_NOBINOPR and priority[op].left > limit do
+			local v2
+			local nextop
 			lexer:next()
 			luaK_infix(ls.fs, op, v)
 			-- read sub-expression with higher priority
-			nextop = subexpr(ls, &v2, priority[op].right)
-			luaK_posfix(ls.fs, op, v, &v2)
+			nextop = subexpr(ls, v2, priority[op].right)
+			luaK_posfix(ls.fs, op, v, v2)
 			op = nextop
 		end
 		return op  -- return first untreated operator
@@ -1137,9 +1078,9 @@ local function parser(lexer)
 	--Rules for statements ----------------------------------------------------
 
 	local function block() -- chunk
-		FuncState *fs = ls.fs
-		BlockCnt bl
-		enterblock(fs, &bl, 0)
+		local fs = ls.fs
+		local bl
+		enterblock(fs, bl, 0)
 		chunk(ls)
 		assert(bl.breaklist == NO_JUMP)
 		leaveblock(fs)
@@ -1161,94 +1102,98 @@ local function parser(lexer)
 	-- assignment.
 
 	local function check_conflict(lh, v)
-		FuncState *fs = ls.fs
-		int extra = fs.freereg  -- eventual position to save local variable
-		int conflict = 0
-		for ( lh lh = lh.prev) then
-		 if (lh.v.k == VINDEXED) then
-			if (lh.v.u.s.info == v.u.s.info) then  -- conflict?
-				conflict = 1
-				lh.v.u.s.info = extra  -- previous assignment will use safe copy
+		local fs = ls.fs
+		local extra = fs.freereg  -- eventual position to save local variable
+		local conflict = 0
+		while lh do
+			if lh.v.k == VINDEXED then
+				if lh.v.u.s.info == v.u.s.info then  -- conflict?
+					conflict = 1
+					lh.v.u.s.info = extra  -- previous assignment will use safe copy
+				end
+				if lh.v.u.s.aux == v.u.s.info then  -- conflict?
+					conflict = 1
+					lh.v.u.s.aux = extra  -- previous assignment will use safe copy
+				end
 			end
-			if (lh.v.u.s.aux == v.u.s.info) then  -- conflict?
-				conflict = 1
-				lh.v.u.s.aux = extra  -- previous assignment will use safe copy
-			end
-		 end
+			lh = lh.prev
 		end
-		if (conflict) then
-		 luaK_codeABC(fs, OP_MOVE, fs.freereg, v.u.s.info, 0)  -- make copy
-		 luaK_reserveregs(fs, 1)
+		if conflict then
+			luaK_codeABC(fs, OP_MOVE, fs.freereg, v.u.s.info, 0)  -- make copy
+			luaK_reserveregs(fs, 1)
 		end
 	end
 
 
 	local function assignment(lh, nvars)
-		expdesc e
-		check_condition(ls, VLOCAL <= lh.v.k and lh.v.k <= VINDEXED,
-								 "syntax error")
-		if (testnext(ls, ',')) then  -- assignment . `,' primaryexp assignment
-		 struct LHS_assign nv
-		 nv.prev = lh
-		 primaryexp(ls, &nv.v)
-		 if (nv.v.k == VLOCAL)
-			check_conflict(ls, lh, &nv.v)
-		 assignment(ls, &nv, nvars+1)
+		local e
+		check_condition(ls, VLOCAL <= lh.v.k and lh.v.k <= VINDEXED, "syntax error")
+		if testnext',' then  -- assignment . `,' primaryexp assignment
+			local nv
+			nv.prev = lh
+			primaryexp(ls, nv.v)
+			if nv.v.k == VLOCAL then
+				check_conflict(ls, lh, nv.v)
+			end
+			assignment(ls, nv, nvars+1)
+		else -- assignment . `=' explist1
+			local nexps
+			checknext(ls, '=')
+			nexps = explist1(ls, e)
+			if nexps ~= nvars then
+				adjust_assign(ls, nvars, nexps, e)
+				if nexps > nvars then
+					ls.fs.freereg = ls.fs.freereg - (nexps - nvars)  -- remove extra values
+				end
+			else
+				luaK_setoneret(ls.fs, e)  -- close last expression
+				luaK_storevar(ls.fs, lh.v, e)
+				return  -- avoid default
+			end
 		end
-		else then  -- assignment . `=' explist1
-		 int nexps
-		 checknext(ls, '=')
-		 nexps = explist1(ls, &e)
-		 if (nexps ~= nvars) then
-			adjust_assign(ls, nvars, nexps, &e)
-			if (nexps > nvars)
-				ls.fs.freereg -= nexps - nvars  -- remove extra values
-		 end
-		 else then
-			luaK_setoneret(ls.fs, &e)  -- close last expression
-			luaK_storevar(ls.fs, &lh.v, &e)
-			return  -- avoid default
-		 end
-		end
-		init_exp(&e, VNONRELOC, ls.fs.freereg-1)  -- default assignment
-		luaK_storevar(ls.fs, &lh.v, &e)
+		init_exp(e, VNONRELOC, ls.fs.freereg-1)  -- default assignment
+		luaK_storevar(ls.fs, lh.v, e)
 	end
 
 
 	local function cond() -- exp
-		expdesc v
-		expr(ls, &v)  -- read condition
-		if (v.k == VNIL) v.k = VFALSE  -- `falses' are all equal here
-		luaK_goiftrue(ls.fs, &v)
+		local v
+		expr(ls, v)  -- read condition
+		if v.k == VNIL then
+			v.k = VFALSE
+		end -- `falses' are all equal here
+		luaK_goiftrue(ls.fs, v)
 		return v.f
 	end
 
 
 	local function breakstat()
-		FuncState *fs = ls.fs
-		BlockCnt *bl = fs.bl
-		int upval = 0
-		while (bl and !bl.isbreakable) then
-		 upval |= bl.upval
-		 bl = bl.previous
+		local fs = ls.fs
+		local bl = fs.bl
+		local upval = 0
+		while bl and not bl.isbreakable do
+			upval = bit.bor(upval, bl.upval)
+			bl = bl.previous
 		end
-		if (!bl)
-		 syntaxerror("no loop to break")
-		if (upval)
-		 luaK_codeABC(fs, OP_CLOSE, bl.nactvar, 0, 0)
-		luaK_concat(fs, &bl.breaklist, luaK_jump(fs))
+		if not bl then
+			syntaxerror("no loop to break")
+		end
+		if upval then
+			luaK_codeABC(fs, OP_CLOSE, bl.nactvar, 0, 0)
+		end
+		luaK_concat(fs, bl.breaklist, luaK_jump(fs))
 	end
 
 
 	local function whilestat(line) -- WHILE cond DO block END
-		FuncState *fs = ls.fs
-		int whileinit
-		int condexit
-		BlockCnt bl
+		local fs = ls.fs
+		local whileinit
+		local condexit
+		local bl
 		lexer:next()  -- skip WHILE
 		whileinit = luaK_getlabel(fs)
 		condexit = cond(ls)
-		enterblock(fs, &bl, 1)
+		enterblock(fs, bl, 1)
 		checknext(ls, TK_DO)
 		block(ls)
 		luaK_patchlist(fs, luaK_jump(fs), whileinit)
@@ -1258,63 +1203,62 @@ local function parser(lexer)
 	end
 
 
-	local function repeatstat (int line) then -- REPEAT block UNTIL cond
-		int condexit
-		FuncState *fs = ls.fs
-		int repeat_init = luaK_getlabel(fs)
-		BlockCnt bl1, bl2
-		enterblock(fs, &bl1, 1)  -- loop block
-		enterblock(fs, &bl2, 0)  -- scope block
+	local function repeatstat(line) -- REPEAT block UNTIL cond
+		local condexit
+		local fs = ls.fs
+		local repeat_init = luaK_getlabel(fs)
+		local bl1, bl2
+		enterblock(fs, bl1, 1)  -- loop block
+		enterblock(fs, bl2, 0)  -- scope block
 		lexer:next()  -- skip REPEAT
 		chunk(ls)
 		check_match(ls, TK_UNTIL, TK_REPEAT, line)
 		condexit = cond(ls)  -- read condition (inside scope block)
-		if (!bl2.upval) then  -- no upvalues?
-		 leaveblock(fs)  -- finish scope
-		 luaK_patchlist(ls.fs, condexit, repeat_init)  -- close the loop
-		end
-		else then  -- complete semantics when there are upvalues
-		 breakstat(ls)  -- if condition then break
-		 luaK_patchtohere(ls.fs, condexit)  -- else...
-		 leaveblock(fs)  -- finish scope...
-		 luaK_patchlist(ls.fs, luaK_jump(fs), repeat_init)  -- and repeat
+		if not bl2.upval then  -- no upvalues?
+			leaveblock(fs)  -- finish scope
+			luaK_patchlist(ls.fs, condexit, repeat_init)  -- close the loop
+		else -- complete semantics when there are upvalues
+			breakstat(ls)  -- if condition then break
+			luaK_patchtohere(ls.fs, condexit)  -- else...
+			leaveblock(fs)  -- finish scope...
+			luaK_patchlist(ls.fs, luaK_jump(fs), repeat_init)  -- and repeat
 		end
 		leaveblock(fs)  -- finish loop
 	end
 
 	local function exp1()
-		expdesc e
-		int k
-		expr(ls, &e)
+		local e
+		local k
+		expr(ls, e)
 		k = e.k
-		luaK_exp2nextreg(ls.fs, &e)
+		luaK_exp2nextreg(ls.fs, e)
 		return k
 	end
 
 	local function forbody(base, line, nvars, isnum) -- forbody -> DO block
-		BlockCnt bl
-		FuncState *fs = ls.fs
-		int prep, endfor
+		local bl
+		local fs = ls.fs
+		local prep, endfor
 		adjustlocalvars(ls, 3)  -- control variables
 		checknext(ls, TK_DO)
-		prep = isnum ? luaK_codeAsBx(fs, OP_FORPREP, base, NO_JUMP) : luaK_jump(fs)
-		enterblock(fs, &bl, 0)  -- scope for declared variables
+		prep = isnum and luaK_codeAsBx(fs, OP_FORPREP, base, NO_JUMP) or luaK_jump(fs)
+		enterblock(fs, bl, 0)  -- scope for declared variables
 		adjustlocalvars(ls, nvars)
 		luaK_reserveregs(fs, nvars)
 		block(ls)
 		leaveblock(fs)  -- end of scope for declared variables
 		luaK_patchtohere(fs, prep)
-		endfor = (isnum) ? luaK_codeAsBx(fs, OP_FORLOOP, base, NO_JUMP) :
+		endfor = isnum and luaK_codeAsBx(fs, OP_FORLOOP, base, NO_JUMP) or
 								luaK_codeABC(fs, OP_TFORLOOP, base, 0, nvars)
 		luaK_fixline(fs, line)  -- pretend that `OP_FOR' starts the loop
-		luaK_patchlist(fs, (isnum ? endfor : luaK_jump(fs)), prep + 1)
+		luaK_patchlist(fs, (isnum and endfor or luaK_jump(fs)), prep + 1)
 	end
 
 
 	-- fornum -> NAME = exp1,exp1[,exp1] forbody
 	local function fornum(varname, line)
-		FuncState *fs = ls.fs
-		int base = fs.freereg
+		local fs = ls.fs
+		local base = fs.freereg
 		new_localvarliteral(ls, "(for index)", 0)
 		new_localvarliteral(ls, "(for limit)", 1)
 		new_localvarliteral(ls, "(for step)", 2)
@@ -1323,11 +1267,11 @@ local function parser(lexer)
 		exp1(ls)  -- initial value
 		checknext(ls, ',')
 		exp1(ls)  -- limit
-		if (testnext(ls, ','))
-		 exp1(ls)  -- optional step
-		else then  -- default step = 1
-		 luaK_codeABx(fs, OP_LOADK, fs.freereg, luaK_numberK(fs, 1))
-		 luaK_reserveregs(fs, 1)
+		if testnext',' then
+			exp1(ls)  -- optional step
+		else -- default step = 1
+			luaK_codeABx(fs, OP_LOADK, fs.freereg, luaK_numberK(fs, 1))
+			luaK_reserveregs(fs, 1)
 		end
 		forbody(ls, base, line, 1, 1)
 	end
@@ -1335,38 +1279,41 @@ local function parser(lexer)
 
 	-- forlist -> NAME {,NAME} IN explist1 forbody
 	local function forlist(indexname)
-		FuncState *fs = ls.fs
-		expdesc e
-		int nvars = 0
-		int line
-		int base = fs.freereg
+		local fs = ls.fs
+		local e
+		local nvars = 0
+		local line
+		local base = fs.freereg
 		-- create control variables
-		new_localvarliteral(ls, "(for generator)", nvars++)
-		new_localvarliteral(ls, "(for state)", nvars++)
-		new_localvarliteral(ls, "(for control)", nvars++)
+		new_localvarliteral(ls, "(for generator)", nvars); nvars = nvars + 1
+		new_localvarliteral(ls, "(for state)", nvars); nvars = nvars + 1
+		new_localvarliteral(ls, "(for control)", nvars); nvars = nvars + 1
 		-- create declared variables
-		new_localvar(ls, indexname, nvars++)
-		while (testnext(ls, ','))
-		 new_localvar(ls, str_checkname(ls), nvars++)
+		new_localvar(ls, indexname, nvars); nvars = nvars + 1
+		while testnext',' do
+			new_localvar(str_checkname(), nvars); nvars = nvars + 1
+		end
 		checknext(ls, TK_IN)
 		line = ls.linenumber
-		adjust_assign(ls, 3, explist1(ls, &e), &e)
+		adjust_assign(ls, 3, explist1(ls, e), e)
 		luaK_checkstack(fs, 3)  -- extra space to call generator
 		forbody(ls, base, line, nvars - 3, 0)
 	end
 
 
 	local function forstat(line) -- forstat -> FOR (fornum | forlist) END
-		FuncState *fs = ls.fs
-		TString *varname
-		BlockCnt bl
-		enterblock(fs, &bl, 1)  -- scope for loop and control variables
+		local fs = ls.fs
+		local varname
+		local bl
+		enterblock(fs, bl, 1)  -- scope for loop and control variables
 		lexer:next()  -- skip `for'
 		varname = str_checkname(ls)  -- first variable name
-		switch (token) then
-		 case '=': fornum(ls, varname, line) break
-		 case ',': case TK_IN: forlist(ls, varname) break
-		 default: syntaxerror(LUA_QL("=") " or " LUA_QL("in") " expected")
+		if token == '=' then
+			fornum(ls, varname, line)
+		elseif token == ',' or token == 'in' then
+			forlist(ls, varname)
+		else
+			syntaxerror'"=" or "in" expected'
 		end
 		check_match(ls, TK_END, TK_FOR, line)
 		leaveblock(fs)  -- loop scope (`break' jumps to this point)
@@ -1375,7 +1322,7 @@ local function parser(lexer)
 
 	-- test_then_block -> [IF | ELSEIF] cond THEN block
 	local function test_then_block()
-		int condexit
+		local condexit
 		lexer:next()  -- skip IF or ELSEIF
 		condexit = cond(ls)
 		checknext(ls, TK_THEN)
@@ -1386,97 +1333,98 @@ local function parser(lexer)
 
 	-- ifstat -> IF cond THEN block {ELSEIF cond THEN block} [ELSE block] END
 	local function ifstat(line)
-		FuncState *fs = ls.fs
-		int flist
-		int escapelist = NO_JUMP
+		local fs = ls.fs
+		local flist
+		local escapelist = NO_JUMP
 		flist = test_then_block(ls)  -- IF cond THEN block
-		while (token == TK_ELSEIF) then
-		 luaK_concat(fs, &escapelist, luaK_jump(fs))
-		 luaK_patchtohere(fs, flist)
-		 flist = test_then_block(ls)  -- ELSEIF cond THEN block
+		while token == 'elseif' do
+			luaK_concat(fs, escapelist, luaK_jump(fs))
+			luaK_patchtohere(fs, flist)
+			flist = test_then_block(ls)  -- ELSEIF cond THEN block
 		end
-		if (token == TK_ELSE) then
-		 luaK_concat(fs, &escapelist, luaK_jump(fs))
-		 luaK_patchtohere(fs, flist)
-		 lexer:next()  -- skip ELSE (after patch, for correct line info)
-		 block(ls)  -- `else' part
-		end
+		if token == 'else' then
+			luaK_concat(fs, escapelist, luaK_jump(fs))
+			luaK_patchtohere(fs, flist)
+			lexer:next()  -- skip ELSE (after patch, for correct line info)
+			block(ls)  -- `else' part
 		else
-		 luaK_concat(fs, &escapelist, flist)
+			luaK_concat(fs, escapelist, flist)
+		end
 		luaK_patchtohere(fs, escapelist)
 		check_match(ls, TK_END, TK_IF, line)
 	end
 
 
-	local function localfunc() then
-		expdesc v, b
-		FuncState *fs = ls.fs
+	local function localfunc()
+		local v, b
+		local fs = ls.fs
 		new_localvar(ls, str_checkname(ls), 0)
-		init_exp(&v, VLOCAL, fs.freereg)
+		init_exp(v, VLOCAL, fs.freereg)
 		luaK_reserveregs(fs, 1)
 		adjustlocalvars(ls, 1)
-		body(ls, &b, 0, ls.linenumber)
-		luaK_storevar(fs, &v, &b)
+		body(ls, b, 0, ls.linenumber)
+		luaK_storevar(fs, v, b)
 		-- debug information will only see the variable after this point!
 		getlocvar(fs, fs.nactvar - 1).startpc = fs.pc
 	end
 
 
 	local function localstat() -- stat -> LOCAL NAME {`,' NAME} [`=' explist1]
-		int nvars = 0
-		int nexps
-		expdesc e
-		do then
-		 new_localvar(ls, str_checkname(ls), nvars++)
-		end while (testnext(ls, ','))
-		if (testnext(ls, '='))
-		 nexps = explist1(ls, &e)
-		else then
-		 e.k = VVOID
-		 nexps = 0
+		local nvars = 0
+		local nexps
+		local e
+		repeat
+			new_localvar(ls, str_checkname(ls), nvars); nvars = nvars + 1
+		until not testnext','
+		if testnext'=' then
+			nexps = explist1(ls, e)
+		else
+			e.k = VVOID
+			nexps = 0
 		end
-		adjust_assign(ls, nvars, nexps, &e)
+		adjust_assign(ls, nvars, nexps, e)
 		adjustlocalvars(ls, nvars)
 	end
 
 
 	local function funcname(v) -- funcname -> NAME thenfieldend [`:' NAME]
-		int needself = 0
+		local needself = 0
 		singlevar(ls, v)
-		while (token == '.')
-		 field(ls, v)
-		if (token == ':') then
-		 needself = 1
-		 field(ls, v)
+		while token == '.' do
+			field(ls, v)
+		end
+		if token == ':' then
+			needself = 1
+			field(ls, v)
 		end
 		return needself
 	end
 
 
 	local function funcstat(line) -- funcstat -> FUNCTION funcname body
-		int needself
-		expdesc v, b
+		local needself
+		local v, b
 		lexer:next()  -- skip FUNCTION
-		needself = funcname(ls, &v)
-		body(ls, &b, needself, line)
-		luaK_storevar(ls.fs, &v, &b)
+		needself = funcname(ls, v)
+		body(ls, b, needself, line)
+		luaK_storevar(ls.fs, v, b)
 		luaK_fixline(ls.fs, line)  -- definition `happens' in the first line
 	end
 
 
 	local function exprstat() -- stat -> func | assignment
-		FuncState *fs = ls.fs
-		struct LHS_assign v
-		primaryexp(ls, &v.v)
-		if (v.v.k == VCALL)  -- stat . func
-		 SETARG_C(getcode(fs, &v.v), 1)  -- call statement uses no results
-		else then  -- stat . assignment
-		 v.prev = NULL
-		 assignment(ls, &v, 1)
+		local fs = ls.fs
+		local v
+		primaryexp(ls, v.v)
+		if v.v.k == VCALL then  -- stat . func
+			SETARG_C(getcode(fs, v.v), 1)  -- call statement uses no results
+		else -- stat . assignment
+			v.prev = nil
+			assignment(ls, v, 1)
 		end
 	end
 
-	local function block_follow(token)
+	local function block_follow()
 		return token == 'else' or token == 'elseif' or token == 'end'
 			or token == 'until' or token == 'eos'
 	end
@@ -1485,7 +1433,7 @@ local function parser(lexer)
 		local e --expdesc
 		local first, nret  -- registers with returned values
 		lexer:next() -- skip RETURN
-		if block_follow(token) or token == ';' then
+		if block_follow() or token == ';' then
 			first = 0
 			nret = 0  -- return no values
 		else
@@ -1498,10 +1446,10 @@ local function parser(lexer)
 				first = fs.nactvar
 				nret = LUA_MULTRET  -- return all values
 			else
-				if (nret == 1)  -- only one single value?
-					first = luaK_exp2anyreg(fs, &e)
+				if nret == 1 then  -- only one single value?
+					first = luaK_exp2anyreg(fs, e)
 				else
-					luaK_exp2nextreg(fs, &e)  -- values must go to the `stack'
+					luaK_exp2nextreg(fs, e)  -- values must go to the `stack'
 					first = fs.nactvar  -- return all `active' values
 					assert(nret == fs.freereg - first)
 				end
@@ -1555,11 +1503,80 @@ local function parser(lexer)
 
 	local function chunk() -- { stat [`;'] }
 		local islast = 0
-		while not islast and not block_follow(token) do
-			islast = statement(ls)
-			testnext(';')
+		while not islast and not block_follow() do
+			islast = statement()
+			testnext';'
 		end
 	end
+
+
+
+
+
+
+	local ls_fs
+
+	local function open_func(fs)
+		fs.prev = ls_fs  -- linked list of funcstates
+		ls_fs = fs
+		--[[
+		fs.pc = 0
+		fs.lasttarget = -1
+		fs.jpc = NO_JUMP
+		fs.freereg = 0
+		fs.nk = 0
+		fs.np = 0
+		fs.nlocvars = 0
+		fs.nactvar = 0
+		fs.bl = nil
+		f.source = ls.source
+		f.maxstacksize = 2  -- registers 0/1 are always valid
+		fs.h = luaH_new(L, 0, 0)
+		]]
+	end
+
+	local function close_func()
+		--[[
+		local fs = ls_fs
+		local f = fs.f
+		removevars(ls, 0)
+		luaK_ret(fs, 0, 0)  -- final return
+		luaM_reallocvector(L, f.code, f.sizecode, fs.pc, Instruction)
+		f.sizecode = fs.pc
+		luaM_reallocvector(L, f.lineinfo, f.sizelineinfo, fs.pc, int)
+		f.sizelineinfo = fs.pc
+		luaM_reallocvector(L, f.k, f.sizek, fs.nk, TValue)
+		f.sizek = fs.nk
+		luaM_reallocvector(L, f.p, f.sizep, fs.np, Proto *)
+		f.sizep = fs.np
+		luaM_reallocvector(L, f.locvars, f.sizelocvars, fs.nlocvars, LocVar)
+		f.sizelocvars = fs.nlocvars
+		luaM_reallocvector(L, f.upvalues, f.sizeupvalues, f.nups, TString *)
+		f.sizeupvalues = f.nups
+		assert(luaG_checkcode(f))
+		assert(fs.bl == nil)
+		]]
+		ls_fs = fs.prev
+	end
+
+	local function parser()
+		local fs = {}
+		open_func(fs)
+		fs.is_vararg = VARARG_ISVARARG  -- main func. is always vararg
+		lex_next() -- read first token
+		chunk()
+		check'eos'
+		close_func()
+		assert(not funcstate.prev)
+		assert(funcstate.f.nups == 0)
+		assert(not ls_fs)
+		return funcstate.f
+	end
+
+	local par = {}
+	par.parser = parser
+
+	return par
 
 end
 
@@ -1589,6 +1606,20 @@ if not ... then
 		f:close()
 	end
 
+	local function parse(file)
+		local f = assert(fs.open(file))
+		local bufread = f:buffered_read()
+		local function read(buf, sz)
+			return assert(f:read(buf, sz))
+		end
+		local lexer = lexer(read, file)
+		local parser = parser(lexer)
+
+		parser:parse()
+
+		f:close()
+	end
+
 	local files = 0
 	for f,d in fs.dir() do
 		if d:is'file' and f:find'%.lua$' then
@@ -1600,8 +1631,10 @@ if not ... then
 				local ok, err
 				if false then
 					ok, err = loadfile(f)
-				else
+				elseif false then
 					ok, err = xpcall(lex, debug.traceback, f)
+				else
+					ok, err = xpcall(parse, debug.traceback, f)
 				end
 				if not ok then
 					print(f, ok, err)
